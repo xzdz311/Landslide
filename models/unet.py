@@ -1,27 +1,18 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from torchvision.models import resnet34, ResNet34_Weights
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 import cv2
-from tqdm import tqdm
+
 import random
-from collections import OrderedDict
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, precision_score, recall_score, jaccard_score
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast  # 混合精度训练
+import numpy as np
+from tqdm import tqdm
+import os
 
 
 # 3. 设置和工具函数
@@ -39,6 +30,22 @@ set_seed()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
+
+# 检查GPU数量
+def setup_multigpu():
+    """设置多GPU环境"""
+    num_gpus = torch.cuda.device_count()
+    print(f"检测到 {num_gpus} 个GPU")
+
+    if num_gpus > 1:
+        print("启用多GPU训练")
+        # 设置设备ID
+        device_ids = list(range(num_gpus))
+        return device_ids
+    else:
+        print("单GPU训练")
+        return None
 
 
 # 4. DEM 读取函数 (OpenCV 替代 rasterio)
@@ -240,7 +247,8 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
 
     print(f"训练集: {len(train_imgs)} 个样本")
     print(f"  - 有滑坡: {len(landslide_train_imgs)} ({len(landslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
-    print(f"  - 无滑坡: {len(nonlandslide_train_imgs)} ({len(nonlandslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
+    print(
+        f"  - 无滑坡: {len(nonlandslide_train_imgs)} ({len(nonlandslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
 
     print(f"测试集: {len(test_imgs)} 个样本")
     print(f"  - 有滑坡: {len(landslide_test_imgs)} ({len(landslide_test_imgs) / len(test_imgs) * 100:.1f}%)")
@@ -283,6 +291,7 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
     )
 
     return train_dataset, test_dataset
+
 
 def split_dataset_with_balance(dataset, test_ratio=0.5, random_seed=42):
     """保持滑坡样本比例的划分"""
@@ -332,53 +341,118 @@ def split_dataset_with_balance(dataset, test_ratio=0.5, random_seed=42):
     val_labels = labels[val_indices]
     test_labels = labels[test_indices]
 
-    print(f"验证集: {len(val_subset)} 样本 (滑坡: {val_labels.sum()}, 非滑坡: {len(val_labels) - val_labels.sum()})")
+    print(
+        f"验证集: {len(val_subset)} 样本 (滑坡: {val_labels.sum()}, 非滑坡: {len(val_labels) - val_labels.sum()})")
     print(
         f"测试集: {len(test_subset)} 样本 (滑坡: {test_labels.sum()}, 非滑坡: {len(test_labels) - test_labels.sum()})")
 
     return val_subset, test_subset
 
 
-def train_model_simple(model, train_loader, val_loader, criterion, optimizer,
-                       scheduler, num_epochs=30, device='cuda'):
+# 优化版本：添加了更多的性能优化
+def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, optimizer,
+                                   scheduler, num_epochs=30, device_ids=None):
+    """
+    多GPU训练函数（优化版）
+
+    优化点：
+    1. 混合精度训练
+    2. 梯度累积（处理大批次）
+    3. 内存优化
+    4. 更高效的进度显示
+    """
+
+    # GPU设置
+    if device_ids is None:
+        device_ids = list(range(torch.cuda.device_count()))
+
+    num_gpus = len(device_ids)
+
+    if num_gpus > 1:
+        model = nn.DataParallel(model, device_ids=device_ids)
+        device = torch.device(f'cuda:{device_ids[0]}')
+        print(f"使用 {num_gpus} 个GPU并行训练")
+    else:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        print(f"使用单GPU训练")
+
+    model = model.to(device)
+
+    # 混合精度训练
+    scaler = GradScaler()
+
+    # 梯度累积步数（模拟更大的batch size）
+    accumulation_steps = 4
+
     best_iou = 0.0
-    history = {'train_loss': [], 'val_loss': [], 'val_iou': [], 'val_precision': [], 'val_recall': []}
+    history = {
+        'train_loss': [], 'val_loss': [], 'val_iou': [],
+        'val_precision': [], 'val_recall': [], 'learning_rate': []
+    }
 
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch + 1}/{num_epochs}')
-        print('-' * 30)
+        print('-' * 40)
 
         # 训练阶段
         model.train()
         train_loss = 0.0
+        batch_count = 0
 
-        pbar = tqdm(train_loader, desc='Training')
-        for optical, dem, mask, is_landslide, _ in pbar:
-            optical = optical.to(device)
-            dem = dem.to(device)
-            mask = mask.to(device)
+        # 使用enumerate获取batch索引
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc='Training')
 
-            optimizer.zero_grad()
+        optimizer.zero_grad()
 
-            # 修改点1: EarlyFusionNet只需要两个输入参数
-            outputs = model(optical, dem)  # outputs是直接的logits
+        for batch_idx, (optical, dem, mask, is_landslide, _) in pbar:
+            batch_count += 1
 
-            # 修改点2: 使用新的损失函数调用方式
-            # 如果criterion是多参数函数，适配它
-            if hasattr(criterion, '__code__') and criterion.__code__.co_argcount > 2:
-                # 如果是原版的复杂损失函数 (outputs, mask, dem)
-                loss = criterion(outputs, mask, dem)
-            else:
-                # 如果是标准损失函数 (outputs, mask)
-                loss = criterion(outputs, mask)
+            optical = optical.to(device, non_blocking=True)
+            dem = dem.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
 
-            loss.backward()
+            # 混合精度前向传播
+            with autocast():
+                outputs = model(optical, dem)
 
+                if hasattr(criterion, '__code__') and criterion.__code__.co_argcount > 2:
+                    loss = criterion(outputs, mask, dem)
+                else:
+                    loss = criterion(outputs, mask)
+
+                # 梯度累积：损失除以累积步数
+                loss = loss / accumulation_steps
+
+            # 反向传播
+            scaler.scale(loss).backward()
+
+            # 梯度累积：每accumulation_steps步更新一次
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # 梯度裁剪
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # 更新参数
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_loss += loss.item() * accumulation_steps
+
+            # 更新进度条
+            if batch_idx % 10 == 0:
+                pbar.set_postfix({
+                    'loss': f'{loss.item() * accumulation_steps:.4f}',
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                })
+
+        # 如果有剩余的梯度，执行一次更新
+        if batch_count % accumulation_steps != 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            train_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
         avg_train_loss = train_loss / len(train_loader)
         history['train_loss'].append(avg_train_loss)
@@ -389,16 +463,16 @@ def train_model_simple(model, train_loader, val_loader, criterion, optimizer,
         val_loss = 0.0
         all_tp, all_fp, all_fn, all_tn = 0, 0, 0, 0
 
-        with torch.no_grad():
+        # 验证阶段不使用混合精度
+        with torch.no_grad(), autocast(enabled=False):
             pbar = tqdm(val_loader, desc='Validation')
             for optical, dem, mask, is_landslide, _ in pbar:
-                optical = optical.to(device)
-                dem = dem.to(device)
-                mask = mask.to(device)
+                optical = optical.to(device, non_blocking=True)
+                dem = dem.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
 
                 outputs = model(optical, dem)
 
-                # 修改点3: 验证时同样适配损失函数
                 if hasattr(criterion, '__code__') and criterion.__code__.co_argcount > 2:
                     loss = criterion(outputs, mask, dem)
                 else:
@@ -406,11 +480,14 @@ def train_model_simple(model, train_loader, val_loader, criterion, optimizer,
 
                 val_loss += loss.item()
 
-                # 获取预测 - EarlyFusionNet直接输出logits
-                pred_probs = torch.sigmoid(outputs)  # 直接sigmoid
+                pred_probs = torch.sigmoid(outputs)
                 preds = (pred_probs > 0.7).float()
 
-                # 计算混淆矩阵
+                # 收集所有GPU的预测
+                if num_gpus > 1:
+                    preds = torch.cat([pred for pred in preds], dim=0)
+                    mask = torch.cat([m for m in mask], dim=0)
+
                 tp = ((preds == 1) & (mask == 1)).sum().item()
                 fp = ((preds == 1) & (mask == 0)).sum().item()
                 fn = ((preds == 0) & (mask == 1)).sum().item()
@@ -421,40 +498,24 @@ def train_model_simple(model, train_loader, val_loader, criterion, optimizer,
                 all_fn += fn
                 all_tn += tn
 
-                batch_precision = tp / max(tp + fp, 1)
-                batch_recall = tp / max(tp + fn, 1)
-                pbar.set_postfix({
-                    'val_loss': loss.item(),
-                    'prec': f'{batch_precision:.3f}',
-                    'rec': f'{batch_recall:.3f}'
-                })
-
-        # 计算总体指标
+        # 计算指标
         avg_val_loss = val_loss / len(val_loader)
 
         precision = all_tp / max(all_tp + all_fp, 1)
         recall = all_tp / max(all_tp + all_fn, 1)
         accuracy = (all_tp + all_tn) / max(all_tp + all_fp + all_fn + all_tn, 1)
-
-        # IoU计算
         iou = all_tp / max(all_tp + all_fp + all_fn, 1)
 
+        # 记录历史
         history['val_loss'].append(avg_val_loss)
         history['val_iou'].append(iou)
         history['val_precision'].append(precision)
         history['val_recall'].append(recall)
+        history['learning_rate'].append(optimizer.param_groups[0]["lr"])
 
         print(f'Val Loss: {avg_val_loss:.4f}')
-        print(f'Val IoU: {iou:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Accuracy: {accuracy:.4f}')
-
-        # 详细统计
-        total_pixels = all_tp + all_fp + all_fn + all_tn
-        print(f'像素级统计:')
-        print(f'  总像素: {total_pixels:,}')
-        print(f'  滑坡像素(TP): {all_tp:,} ({all_tp / total_pixels * 100:.2f}%)')
-        print(f'  误报像素(FP): {all_fp:,} ({all_fp / total_pixels * 100:.2f}%)')
-        print(f'  漏报像素(FN): {all_fn:,} ({all_fn / total_pixels * 100:.2f}%)')
-        print(f'  正确负像素(TN): {all_tn:,} ({all_tn / total_pixels * 100:.2f}%)')
+        print(f'Val IoU: {iou:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}')
+        print(f'学习率: {optimizer.param_groups[0]["lr"]:.6f}')
 
         # 学习率调度
         if scheduler is not None:
@@ -466,10 +527,19 @@ def train_model_simple(model, train_loader, val_loader, criterion, optimizer,
         # 保存最佳模型
         if iou > best_iou:
             best_iou = iou
-            torch.save(model.state_dict(), 'best_earlyfusion_model.pth')
-            print(f'✓ 保存最佳模型，IoU: {best_iou:.4f}')
+            model_to_save = model.module if num_gpus > 1 else model
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model_to_save.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'best_iou': best_iou,
+                'history': history,
+            }, 'best_unet_model.pth')
+            print(f'✓ 保存最佳模型检查点，IoU: {best_iou:.4f}')
 
     return model, history
+
 
 def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions'):
     """
@@ -822,6 +892,7 @@ class UNet(nn.Module):
         # 输出
         return self.outc(x)
 
+
 def get_simple_training_config():
     """获取简单训练配置"""
 
@@ -888,8 +959,6 @@ def get_simple_training_config():
     return model, combined_loss, optimizer, scheduler
 
 
-
-
 def main():
     """主训练函数"""
 
@@ -899,6 +968,8 @@ def main():
     print(f"模型架构: {model.__class__.__name__}")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
+    device_ids = list(range(torch.cuda.device_count()))
+    print(f"可用的GPU: {device_ids}")
 
     # 设置
     set_seed(42)
@@ -929,24 +1000,23 @@ def main():
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # 训练模型
-    model, history = train_model_simple(
+    model, history = train_model_multigpu_optimized(
         model=model,
         train_loader=train_loader,  # 你的训练数据加载器
         val_loader=val_loader,  # 你的验证数据加载器
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
-        num_epochs=50,  # 可以增加epoch
-        device='cuda'
+        num_epochs=100,  # 可以增加epoch
+        device_ids=device_ids
     )
 
     # 保存最终模型
-    torch.save(model.state_dict(), 'final_earlyfusion_model.pth')
+    torch.save(model.state_dict(), 'unet_model.pth')
     print("训练完成!")
 
     # 1. 加载训练好的模型
-    model = UNet(n_channels=4, n_classes=1).to('cuda')
-    model.load_state_dict(torch.load('best_earlyfusion_model.pth'))
+    model.load_state_dict(torch.load('unet_model.pth'))
     model.eval()
 
     # 2. 运行评估
