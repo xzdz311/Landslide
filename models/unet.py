@@ -994,13 +994,13 @@ def main():
     print(f"测试集: {len(test_subset)} 样本")
 
     # 创建数据加载器
-    batch_size = 8
+    batch_size = 16
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # 训练模型
-    model, history = train_model_multigpu_optimized(
+    train_model, history = train_model_multigpu_optimized(
         model=model,
         train_loader=train_loader,  # 你的训练数据加载器
         val_loader=val_loader,  # 你的验证数据加载器
@@ -1012,11 +1012,17 @@ def main():
     )
 
     # 保存最终模型
-    torch.save(model.state_dict(), 'unet_model.pth')
+    # 保存最终模型
+    if device_ids and len(device_ids) > 1:
+        # 多GPU训练时，保存module
+        torch.save(train_model.module.state_dict(), 'final_unet_model.pth')
+    else:
+        torch.save(train_model.state_dict(), 'final_unet_model.pth')
+    print("📁 最终模型已保存为 final_unet_model.pth")
     print("训练完成!")
 
     # 1. 加载训练好的模型
-    model.load_state_dict(torch.load('unet_model.pth'))
+    model.load_state_dict(torch.load('final_unet_model.pth'))
     model.eval()
 
     # 2. 运行评估

@@ -1,4 +1,3 @@
-
 import cv2
 
 import random
@@ -14,6 +13,7 @@ from torch.cuda.amp import GradScaler, autocast  # 混合精度训练
 import numpy as np
 from tqdm import tqdm
 import os
+
 
 # 3. 设置和工具函数
 def set_seed(seed=42):
@@ -46,7 +46,6 @@ def setup_multigpu():
     else:
         print("单GPU训练")
         return None
-
 
 
 # 4. DEM 读取函数 (OpenCV 替代 rasterio)
@@ -291,6 +290,7 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
     )
 
     return train_dataset, test_dataset
+
 
 def split_dataset_with_balance(dataset, test_ratio=0.5, random_seed=42):
     """保持滑坡样本比例的划分"""
@@ -538,10 +538,11 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
 
     return model, history
 
-def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions'):
+
+def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions', multigpu=False):
     """
     适配EarlyFusionNet的预测评估函数
-    EarlyFusionNet输出格式: 直接logits [B, 1, H, W]
+    修改：支持5个返回值的数据加载器
     """
     import os
     import cv2
@@ -552,6 +553,18 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     from sklearn.metrics import jaccard_score, precision_score, recall_score, f1_score
 
     os.makedirs(save_dir, exist_ok=True)
+
+    if multigpu and torch.cuda.device_count() > 1:
+        device_ids = list(range(torch.cuda.device_count()))
+        print(f"使用多GPU评估: {device_ids}")
+        model = nn.DataParallel(model, device_ids=device_ids)
+        # 设置主设备
+        if isinstance(device, str):
+            device = torch.device(f'cuda:{device_ids[0]}')
+
+    model = model.to(device)
+    model.eval()
+
     model.eval()
 
     all_preds = []
@@ -560,7 +573,19 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     sample_results = []  # 保存每个样本的结果
 
     with torch.no_grad():
-        for i, (optical, dem, mask, img_paths) in enumerate(tqdm(test_loader, desc='Testing')):
+        for i, batch in enumerate(tqdm(test_loader, desc='Testing')):
+            # ===== 修改这里：支持多种数据格式 =====
+            if len(batch) == 4:
+                # 格式: (optical, dem, mask, img_paths)
+                optical, dem, mask, img_paths = batch
+                is_landslide = None
+            elif len(batch) == 5:
+                # 格式: (optical, dem, mask, is_landslide, img_paths)
+                optical, dem, mask, is_landslide, img_paths = batch
+            else:
+                raise ValueError(f"意外的batch长度: {len(batch)}")
+            # ===== 修改结束 =====
+
             optical = optical.to(device)
             dem = dem.to(device)
             mask = mask.cpu()  # 在CPU上处理mask
@@ -618,8 +643,7 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
 
                                 # 预测结果
                                 axs[3].imshow(pred_prob, cmap='jet', vmin=0, vmax=1)
-                                axs[3].set_title(f'Prediction (IoU: {metrics["iou"][-1]:.3f}'
-                                                 if len(metrics['iou']) > j else 'Prediction')
+                                axs[3].set_title(f'Prediction')
                                 axs[3].axis('off')
 
                                 plt.tight_layout()
@@ -955,6 +979,7 @@ class UNetPlusPlus(nn.Module):
         # 输出 - 始终返回单个张量
         return self.outc(X_04)
 
+
 def get_simple_training_config():
     """获取简单训练配置"""
 
@@ -1021,6 +1046,51 @@ def get_simple_training_config():
     return model, combined_loss, optimizer, scheduler
 
 
+def load_model_with_multigpu_support(model, model_path):
+    """
+    加载模型，自动处理多GPU训练的权重
+
+    参数:
+        model: 模型实例
+        model_path: 权重文件路径
+
+    返回:
+        model: 加载权重后的模型
+    """
+    # 加载权重
+    checkpoint = torch.load(model_path, map_location='cpu')
+
+    # 提取state_dict
+    if isinstance(checkpoint, dict):
+        # 检查是完整checkpoint还是直接state_dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    # 检查是否是多GPU权重
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        print("🔄 处理多GPU训练权重...")
+        # 移除'module.'前缀
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                new_key = key[7:]  # 去掉'module.'
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        state_dict = new_state_dict
+
+    # 加载权重
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    print(f" 模型权重已加载（{len(state_dict)}个参数）")
+    return model
 
 
 def main():
@@ -1058,13 +1128,13 @@ def main():
     print(f"测试集: {len(test_subset)} 样本")
 
     # 创建数据加载器
-    batch_size = 8
+    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # 训练模型
-    model, history = train_model_multigpu_optimized(
+    train_model, history = train_model_multigpu_optimized(
         model=model,
         train_loader=train_loader,  # 你的训练数据加载器
         val_loader=val_loader,  # 你的验证数据加载器
@@ -1076,11 +1146,16 @@ def main():
     )
 
     # 保存最终模型
-    torch.save(model.state_dict(), 'unet++_model.pth')
+    if device_ids and len(device_ids) > 1:
+        # 多GPU训练时，保存module
+        torch.save(train_model.module.state_dict(), 'final_unetplusplus_model.pth')
+    else:
+        torch.save(train_model.state_dict(), 'final_unetplusplus_model.pth')
+    print("最终模型已保存为 'final_unetplusplus_model.pth'")
     print("训练完成!")
-
     # 1. 加载训练好的模型
-    model.load_state_dict(torch.load('best_unet++_model.pth'))
+
+    model.load_state_dict(torch.load('final_unetplusplus_model.pth'))
     model.eval()
 
     # 2. 运行评估
@@ -1088,7 +1163,8 @@ def main():
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
         device='cuda',
-        save_dir='predictions_results'
+        save_dir='predictions_results',
+        multigpu=True
     )
 
 
