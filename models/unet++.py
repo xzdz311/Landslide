@@ -1148,14 +1148,14 @@ def main():
     # 保存最终模型
     if device_ids and len(device_ids) > 1:
         # 多GPU训练时，保存module
-        torch.save(train_model.module.state_dict(), 'final_unetplusplus_model.pth')
+        torch.save(train_model.module.state_dict(), '/kaggle/working/final_unetplusplus_model.pth')
     else:
-        torch.save(train_model.state_dict(), 'final_unetplusplus_model.pth')
+        torch.save(train_model.state_dict(), '/kaggle/working/final_unetplusplus_model.pth')
     print("最终模型已保存为 'final_unetplusplus_model.pth'")
     print("训练完成!")
     # 1. 加载训练好的模型
 
-    model.load_state_dict(torch.load('final_unetplusplus_model.pth'))
+    model.load_state_dict(torch.load('/kaggle/working/final_unetplusplus_model.pth'))
     model.eval()
 
     # 2. 运行评估

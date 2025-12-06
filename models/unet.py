@@ -247,8 +247,7 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
 
     print(f"训练集: {len(train_imgs)} 个样本")
     print(f"  - 有滑坡: {len(landslide_train_imgs)} ({len(landslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
-    print(
-        f"  - 无滑坡: {len(nonlandslide_train_imgs)} ({len(nonlandslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
+    print(f"  - 无滑坡: {len(nonlandslide_train_imgs)} ({len(nonlandslide_train_imgs) / len(train_imgs) * 100:.1f}%)")
 
     print(f"测试集: {len(test_imgs)} 个样本")
     print(f"  - 有滑坡: {len(landslide_test_imgs)} ({len(landslide_test_imgs) / len(test_imgs) * 100:.1f}%)")
@@ -341,8 +340,7 @@ def split_dataset_with_balance(dataset, test_ratio=0.5, random_seed=42):
     val_labels = labels[val_indices]
     test_labels = labels[test_indices]
 
-    print(
-        f"验证集: {len(val_subset)} 样本 (滑坡: {val_labels.sum()}, 非滑坡: {len(val_labels) - val_labels.sum()})")
+    print(f"验证集: {len(val_subset)} 样本 (滑坡: {val_labels.sum()}, 非滑坡: {len(val_labels) - val_labels.sum()})")
     print(
         f"测试集: {len(test_subset)} 样本 (滑坡: {test_labels.sum()}, 非滑坡: {len(test_labels) - test_labels.sum()})")
 
@@ -535,16 +533,16 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                 'best_iou': best_iou,
                 'history': history,
-            }, 'best_unet_model.pth')
+            }, 'best_UNet_checkpoint.pth')
             print(f'✓ 保存最佳模型检查点，IoU: {best_iou:.4f}')
 
     return model, history
 
 
-def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions'):
+def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions', multigpu=False):
     """
     适配EarlyFusionNet的预测评估函数
-    EarlyFusionNet输出格式: 直接logits [B, 1, H, W]
+    修改：支持5个返回值的数据加载器
     """
     import os
     import cv2
@@ -554,7 +552,17 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     from tqdm import tqdm
     from sklearn.metrics import jaccard_score, precision_score, recall_score, f1_score
 
-    os.makedirs(save_dir, exist_ok=True)
+    if multigpu and torch.cuda.device_count() > 1:
+        device_ids = list(range(torch.cuda.device_count()))
+        print(f"使用多GPU评估: {device_ids}")
+        model = nn.DataParallel(model, device_ids=device_ids)
+        # 设置主设备
+        if isinstance(device, str):
+            device = torch.device(f'cuda:{device_ids[0]}')
+
+    model = model.to(device)
+    model.eval()
+
     model.eval()
 
     all_preds = []
@@ -563,7 +571,19 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     sample_results = []  # 保存每个样本的结果
 
     with torch.no_grad():
-        for i, (optical, dem, mask, img_paths) in enumerate(tqdm(test_loader, desc='Testing')):
+        for i, batch in enumerate(tqdm(test_loader, desc='Testing')):
+            # ===== 修改这里：支持多种数据格式 =====
+            if len(batch) == 4:
+                # 格式: (optical, dem, mask, img_paths)
+                optical, dem, mask, img_paths = batch
+                is_landslide = None
+            elif len(batch) == 5:
+                # 格式: (optical, dem, mask, is_landslide, img_paths)
+                optical, dem, mask, is_landslide, img_paths = batch
+            else:
+                raise ValueError(f"意外的batch长度: {len(batch)}")
+            # ===== 修改结束 =====
+
             optical = optical.to(device)
             dem = dem.to(device)
             mask = mask.cpu()  # 在CPU上处理mask
@@ -587,10 +607,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
 
                 # 保存原始预测（浮点数概率）
                 pred_prob = pred_probs[j].squeeze().numpy()
-                np.save(os.path.join(save_dir, f'prob_{base_name}.npy'), pred_prob)
-
-                # 保存二值化预测
-                cv2.imwrite(os.path.join(save_dir, f'pred_{base_name}.png'), pred_mask_uint8)
 
                 # 保存可视化结果（如果有真实掩膜）
                 if mask[j].sum() > 0:
@@ -621,13 +637,10 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
 
                                 # 预测结果
                                 axs[3].imshow(pred_prob, cmap='jet', vmin=0, vmax=1)
-                                axs[3].set_title(f'Prediction (IoU: {metrics["iou"][-1]:.3f}'
-                                                 if len(metrics['iou']) > j else 'Prediction')
+                                axs[3].set_title(f'Prediction')
                                 axs[3].axis('off')
 
                                 plt.tight_layout()
-                                plt.savefig(os.path.join(save_dir, f'vis_{base_name}.png'),
-                                            bbox_inches='tight', dpi=100)
                                 plt.close()
                     except Exception as e:
                         print(f"可视化 {img_name} 时出错: {e}")
@@ -893,6 +906,7 @@ class UNet(nn.Module):
         return self.outc(x)
 
 
+
 def get_simple_training_config():
     """获取简单训练配置"""
 
@@ -959,6 +973,53 @@ def get_simple_training_config():
     return model, combined_loss, optimizer, scheduler
 
 
+def load_model_with_multigpu_support(model, model_path):
+    """
+    加载模型，自动处理多GPU训练的权重
+
+    参数:
+        model: 模型实例
+        model_path: 权重文件路径
+
+    返回:
+        model: 加载权重后的模型
+    """
+    # 加载权重
+    checkpoint = torch.load(model_path, map_location='cpu')
+
+    # 提取state_dict
+    if isinstance(checkpoint, dict):
+        # 检查是完整checkpoint还是直接state_dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    # 检查是否是多GPU权重
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        print("🔄 处理多GPU训练权重...")
+        # 移除'module.'前缀
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                new_key = key[7:]  # 去掉'module.'
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        state_dict = new_state_dict
+
+    # 加载权重
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    print(f" 模型权重已加载（{len(state_dict)}个参数）")
+    return model
+
+
 def main():
     """主训练函数"""
 
@@ -994,7 +1055,7 @@ def main():
     print(f"测试集: {len(test_subset)} 样本")
 
     # 创建数据加载器
-    batch_size = 16
+    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
@@ -1012,17 +1073,16 @@ def main():
     )
 
     # 保存最终模型
-    # 保存最终模型
     if device_ids and len(device_ids) > 1:
         # 多GPU训练时，保存module
-        torch.save(train_model.module.state_dict(), 'final_unet_model.pth')
+        torch.save(train_model.module.state_dict(), '/kaggle/working/final_UNet_model.pth')
     else:
-        torch.save(train_model.state_dict(), 'final_unet_model.pth')
-    print("📁 最终模型已保存为 final_unet_model.pth")
+        torch.save(train_model.state_dict(), '/kaggle/working/final_UNet_model.pth')
+    print("最终模型已保存为 'final_UNet_model.pth'")
     print("训练完成!")
-
     # 1. 加载训练好的模型
-    model.load_state_dict(torch.load('final_unet_model.pth'))
+
+    model.load_state_dict(torch.load('/kaggle/working/final_UNet_model.pth'))
     model.eval()
 
     # 2. 运行评估
@@ -1030,10 +1090,12 @@ def main():
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
         device='cuda',
-        save_dir='predictions_results'
+        save_dir='predictions_results',
+        multigpu=True
     )
 
 
 # 运行调试
 if __name__ == "__main__":
     main()
+
