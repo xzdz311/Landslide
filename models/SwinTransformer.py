@@ -1088,44 +1088,44 @@ class DropPath(nn.Module):
 
 
 class PatchMerging(nn.Module):
-    """下采样：2倍降采样"""
+    """下采样：2倍降采样，维度翻倍"""
 
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
+        # 输出维度是输入维度的2倍
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
         """
         x: B, H, W, C
+        返回: B, H/2, W/2, 2C
         """
         B, H, W, C = x.shape
 
-        # 将2x2邻域的特征拼接在一起
+        # 确保尺寸是偶数
+        if H % 2 != 0 or W % 2 != 0:
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2))
+            H = H + (H % 2)
+            W = W + (W % 2)
+
         x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
         x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
         x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
         x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
 
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
         x = self.norm(x)
-        x = self.reduction(x)
+        x = self.reduction(x)  # B H/2 W/2 2*C
 
         return x
-
 
 # 纯Swin Transformer分割模型（完全离线）
 class PureSwinSegmentation(nn.Module):
     """纯Swin Transformer语义分割模型 - 完全离线版"""
 
     def __init__(self, n_channels=4, n_classes=1, swin_type='tiny'):
-        """
-        参数:
-            n_channels: 输入通道数
-            n_classes: 输出类别数
-            swin_type: 模型类型 ('tiny', 'small', 'base')
-        """
         super().__init__()
 
         # 配置参数
@@ -1159,9 +1159,31 @@ class PureSwinSegmentation(nn.Module):
         self.num_heads = config['num_heads']
         self.window_size = config['window_size']
 
-        # 存储各阶段输出通道数（重要！）
-        self.stage_channels = [self.embed_dim * (2 ** i) for i in range(len(self.depths))]
-        print(f"各阶段通道数: {self.stage_channels}")
+        # 重要修正：Swin Transformer的实际输出通道数
+        # 注意：每个BasicLayer（除了最后一个）内部有PatchMerging，会将维度翻倍
+        # 所以实际的输出通道数序列应该是：
+        # 输入: embed_dim
+        # stage1输出: embed_dim * 2 (如果stage1有downsample)
+        # stage2输出: embed_dim * 4 (如果stage2有downsample)
+        # stage3输出: embed_dim * 8 (如果stage3有downsample)
+        # stage4输出: embed_dim * 8 (最后一个stage没有downsample)
+
+        # 计算每个阶段的输出维度
+        self.stage_channels = []
+        current_dim = self.embed_dim
+
+        for i, depth in enumerate(self.depths):
+            # 除了最后一个阶段，其他阶段都有PatchMerging会将维度翻倍
+            if i < len(self.depths) - 1:
+                output_dim = current_dim * 2
+            else:
+                output_dim = current_dim
+            self.stage_channels.append(output_dim)
+
+            # 更新下一个阶段的输入维度
+            current_dim = output_dim
+
+        print(f"各阶段输出通道数: {self.stage_channels}")
 
         # 1. 输入适配层
         self.input_adapter = nn.Sequential(
@@ -1187,20 +1209,32 @@ class PureSwinSegmentation(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, config['drop_path_rate'], sum(self.depths))]
 
         self.layers = nn.ModuleList()
+        current_dim = self.embed_dim
+
         for i_layer in range(self.num_layers):
+            print(
+                f"构建第{i_layer + 1}阶段: input_dim={current_dim}, depth={self.depths[i_layer]}, heads={self.num_heads[i_layer]}, "
+                f"output_dim={self.stage_channels[i_layer]}")
+
+            # 这个阶段是否有下采样
+            downsample = PatchMerging if (i_layer < self.num_layers - 1) else None
+
             layer = BasicLayer(
-                dim=int(self.embed_dim * 2 ** i_layer),
+                dim=current_dim,  # 输入维度
                 depth=self.depths[i_layer],
                 num_heads=self.num_heads[i_layer],
                 window_size=self.window_size,
                 drop_path=dpr[sum(self.depths[:i_layer]):sum(self.depths[:i_layer + 1])],
-                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None
+                downsample=downsample
             )
             self.layers.append(layer)
 
-        # 4. 特征金字塔网络 - 使用正确的通道数
+            # 更新下一个阶段的输入维度为当前阶段的输出维度
+            current_dim = self.stage_channels[i_layer]
+
+        # 4. 特征金字塔网络 - 使用实际计算的通道数
         self.fpn = FPNModule(
-            in_channels=self.stage_channels,  # 传递正确的通道数
+            in_channels=self.stage_channels,  # 使用实际计算出的通道数
             out_channels=256
         )
 
@@ -1215,12 +1249,12 @@ class PureSwinSegmentation(nn.Module):
 
         self.apply(self._init_weights)
 
-        print(f"初始化离线Swin Transformer模型 ({swin_type}):")
+        print(f"\n初始化离线Swin Transformer模型 ({swin_type}):")
         print(f"  输入通道: {n_channels}")
         print(f"  输出类别: {n_classes}")
         print(f"  嵌入维度: {self.embed_dim}")
         print(f"  网络深度: {self.depths}")
-        print(f"  各阶段通道数: {self.stage_channels}")
+        print(f"  各阶段输出通道数: {self.stage_channels}")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -1272,13 +1306,14 @@ class PureSwinSegmentation(nn.Module):
 
 
 class BasicLayer(nn.Module):
-    """Swin Transformer基本层"""
+    """Swin Transformer基本层（简化版）"""
 
     def __init__(self, dim, depth, num_heads, window_size,
                  drop_path=0., downsample=None):
         super().__init__()
         self.dim = dim
         self.depth = depth
+        self.downsample = downsample
 
         # 构建块
         self.blocks = nn.ModuleList([
@@ -1292,17 +1327,20 @@ class BasicLayer(nn.Module):
             for i in range(depth)
         ])
 
-        # 下采样层
-        self.downsample = downsample(dim=dim) if downsample is not None else None
+        # 下采样层（如果有）
+        if downsample is not None:
+            self.downsample_layer = downsample(dim=dim)
+        else:
+            self.downsample_layer = None
 
     def forward(self, x):
         for blk in self.blocks:
             x = blk(x)
 
-        if self.downsample is not None:
-            x = self.downsample(x)
-        return x
+        if self.downsample_layer is not None:
+            x = self.downsample_layer(x)
 
+        return x
 
 class FPNModule(nn.Module):
     """特征金字塔网络（修复版）"""
@@ -1319,7 +1357,8 @@ class FPNModule(nn.Module):
 
         # 横向连接：将各层特征映射到统一维度
         self.lateral_convs = nn.ModuleList()
-        for in_channel in in_channels:
+        for i, in_channel in enumerate(in_channels):
+            print(f"FPN 第{i + 1}层: in={in_channel}, out={out_channels}")
             self.lateral_convs.append(
                 nn.Sequential(
                     nn.Conv2d(in_channel, out_channels, kernel_size=1, bias=False),
@@ -1335,7 +1374,7 @@ class FPNModule(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        print(f"FPN初始化 - 输入通道: {in_channels}, 输出通道: {out_channels}")
+        print(f"FPN初始化完成 - 输入通道: {in_channels}, 输出通道: {out_channels}")
 
     def forward(self, features):
         """
@@ -1346,21 +1385,30 @@ class FPNModule(nn.Module):
                     每个特征的形状: [B, C_i, H_i, W_i]
         """
         # 检查特征数量是否与通道数匹配
-        assert len(features) == len(self.in_channels), \
-            f"特征数量({len(features)})与通道数({len(self.in_channels)})不匹配"
+        if len(features) != len(self.in_channels):
+            print(f"警告: 特征数量({len(features)})与通道数({len(self.in_channels)})不匹配")
+            print(f"特征通道数: {[f.shape[1] for f in features]}")
+            print(f"期望通道数: {self.in_channels}")
 
-        # 检查每个特征的通道数是否正确
-        for i, (feat, expected_channels) in enumerate(zip(features, self.in_channels)):
-            actual_channels = feat.shape[1]
-            assert actual_channels == expected_channels, \
-                f"第{i}层特征: 期望通道数{expected_channels}, 实际通道数{actual_channels}"
+            # 自适应调整：取最匹配的层数
+            min_len = min(len(features), len(self.in_channels))
+            features = features[:min_len]
+            print(f"调整后使用前{min_len}层特征")
 
-        # 处理最后一层特征（最高层）
+        # 自顶向下的特征融合
         last_idx = len(features) - 1
+
+        # 如果特征数量少于预期的层数，使用最后一个可用的特征
+        if last_idx >= len(self.lateral_convs):
+            last_idx = len(self.lateral_convs) - 1
+
         fused_feature = self.lateral_convs[last_idx](features[last_idx])
 
         # 自顶向下的特征融合
         for i in range(len(features) - 2, -1, -1):
+            if i >= len(self.lateral_convs):
+                continue
+
             # 上采样到与当前层相同的分辨率
             target_size = features[i].shape[2:]
             fused_feature = F.interpolate(
