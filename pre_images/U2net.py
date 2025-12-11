@@ -360,6 +360,8 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     from tqdm import tqdm
     from sklearn.metrics import jaccard_score, precision_score, recall_score, f1_score
 
+    os.makedirs(save_dir, exist_ok=True)
+
     if multigpu and torch.cuda.device_count() > 1:
         device_ids = list(range(torch.cuda.device_count()))
         print(f"使用多GPU评估: {device_ids}")
@@ -415,6 +417,10 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
 
                 # 保存原始预测（浮点数概率）
                 pred_prob = pred_probs[j].squeeze().numpy()
+                np.save(os.path.join(save_dir, f'prob_{base_name}.npy'), pred_prob)
+
+                # 保存二值化预测
+                cv2.imwrite(os.path.join(save_dir, f'pred_{base_name}.png'), pred_mask_uint8)
 
                 # 保存可视化结果（如果有真实掩膜）
                 if mask[j].sum() > 0:
@@ -449,6 +455,8 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
                                 axs[3].axis('off')
 
                                 plt.tight_layout()
+                                plt.savefig(os.path.join(save_dir, f'vis_{base_name}.png'),
+                                            bbox_inches='tight', dpi=100)
                                 plt.close()
                     except Exception as e:
                         print(f"可视化 {img_name} 时出错: {e}")
