@@ -358,6 +358,7 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
     2. 梯度累积（处理大批次）
     3. 内存优化
     4. 更高效的进度显示
+    5. 早停机制（防止梯度爆炸导致的持续训练）
     """
 
     # GPU设置
@@ -382,7 +383,12 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
     # 梯度累积步数（模拟更大的batch size）
     accumulation_steps = 4
 
+    # 添加早停机制相关变量
     best_iou = 0.0
+    patience = 10  # 容忍多少个epoch没有改善
+    no_improve_epochs = 0
+    early_stop = False
+
     history = {
         'train_loss': [], 'val_loss': [], 'val_iou': [],
         'val_precision': [], 'val_recall': [], 'learning_rate': []
@@ -391,6 +397,11 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch + 1}/{num_epochs}')
         print('-' * 40)
+
+        # 检查是否需要早停
+        if early_stop:
+            print(f"⚠️  早停机制触发，停止训练")
+            break
 
         # 训练阶段
         model.train()
@@ -525,6 +536,7 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
         # 保存最佳模型
         if iou > best_iou:
             best_iou = iou
+            no_improve_epochs = 0  # 重置无改善计数
             model_to_save = model.module if num_gpus > 1 else model
             torch.save({
                 'epoch': epoch,
@@ -535,9 +547,42 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
                 'history': history,
             }, 'best_FCN_checkpoint.pth')
             print(f'✓ 保存最佳模型检查点，IoU: {best_iou:.4f}')
+        else:
+            no_improve_epochs += 1
+            print(f'⚠️  连续 {no_improve_epochs} 个epoch没有改善 (最佳IoU: {best_iou:.4f})')
+
+            # 检查是否应该早停
+            if no_improve_epochs >= patience:
+                early_stop = True
+                print(f'🚨 早停：连续 {patience} 个epoch没有改善')
+
+        # 检查训练损失是否异常（梯度爆炸的迹象）
+        if avg_train_loss > 1e5:  # 训练损失异常大
+            print(f'🚨 训练损失异常 ({avg_train_loss:.2f})，可能是梯度爆炸，停止训练')
+            early_stop = True
+        elif avg_train_loss != avg_train_loss:  # 检查NaN
+            print(f'🚨 训练损失为NaN，可能是梯度爆炸，停止训练')
+            early_stop = True
+
+    # 保存最终模型（无论是否早停）
+    model_to_save = model.module if num_gpus > 1 else model
+    final_checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model_to_save.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'best_iou': best_iou,
+        'history': history,
+        'early_stopped': early_stop,
+        'final_epoch': epoch
+    }
+
+    torch.save(final_checkpoint, 'final_FCN_model.pth')
+    print(f'最终模型已保存，最佳IoU: {best_iou:.4f}')
+    if early_stop:
+        print(f'训练提前停止于第 {epoch + 1} 个epoch')
 
     return model, history
-
 
 def predict_and_evaluate(model, test_loader, device='cuda', save_dir='predictions', multigpu=False):
     """
