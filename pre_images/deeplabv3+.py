@@ -2,7 +2,7 @@ import cv2
 
 import random
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
@@ -12,8 +12,7 @@ from torch.cuda.amp import GradScaler, autocast  # 混合精度训练
 import numpy as np
 from tqdm import tqdm
 import os
-sys.path.append('/kaggle/input/resnet/pytorch/default/1/')
-from pre_images.resnet import build_resnet_backbone
+from resnet import build_resnet_backbone, BasicBlock, Bottleneck
 
 
 # 3. 设置和工具函数
@@ -766,6 +765,8 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     return results
 
 
+
+
 def visualize_predictions_comparison(model, test_loader, device='cuda', num_samples=5):
     """
     可视化预测对比（单独函数，更清晰）
@@ -1059,7 +1060,7 @@ def get_simple_training_config():
     """获取简单训练配置"""
 
     # 1. 创建简单模型
-    model = DeepLabV3PlusResNet(n_channels=4, n_classes=1,backbone='resnet50').to('cuda')
+    model = DeepLabV3PlusResNet(n_channels=4, n_classes=1,backbone='resnet50')
 
     # 2. 使用标准损失函数（先排除复杂的损失函数）
     def simple_loss(pred, target):
@@ -1081,27 +1082,6 @@ def get_simple_training_config():
 
         return bce + dice_loss
 
-    def combined_loss_v1(pred, target, alpha=0.25, gamma=2.0, dice_weight=0.5):
-        """
-        Focal Loss + Dice Loss
-        优点：自动处理类别不平衡，对简单样本降权
-        适合：FP过多，正负样本极不平衡的情况
-        """
-        # Focal Loss部分
-        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
-        focal_loss = focal_loss.mean()
-
-        # Dice Loss部分
-        probs = torch.sigmoid(pred)
-        smooth = 1e-6
-        intersection = (probs * target).sum(dim=(1, 2, 3))
-        union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-        dice = (2. * intersection + smooth) / (union + smooth)
-        dice_loss = 1 - dice.mean()
-
-        return focal_loss + dice_weight * dice_loss
 
     # 3. 优化器
     optimizer = torch.optim.AdamW(
@@ -1120,54 +1100,6 @@ def get_simple_training_config():
 
     return model, combined_loss, optimizer, scheduler
 
-
-def load_model_with_multigpu_support(model, model_path):
-    """
-    加载模型，自动处理多GPU训练的权重
-
-    参数:
-        model: 模型实例
-        model_path: 权重文件路径
-
-    返回:
-        model: 加载权重后的模型
-    """
-    # 加载权重
-    checkpoint = torch.load(model_path, map_location='cpu')
-
-    # 提取state_dict
-    if isinstance(checkpoint, dict):
-        # 检查是完整checkpoint还是直接state_dict
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-    else:
-        state_dict = checkpoint
-
-    # 检查是否是多GPU权重
-    if any(key.startswith('module.') for key in state_dict.keys()):
-        print("🔄 处理多GPU训练权重...")
-        # 移除'module.'前缀
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('module.'):
-                new_key = key[7:]  # 去掉'module.'
-            else:
-                new_key = key
-            new_state_dict[new_key] = value
-        state_dict = new_state_dict
-
-    # 加载权重
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    print(f" 模型权重已加载（{len(state_dict)}个参数）")
-    return model
-
-
 def main():
     """主训练函数"""
 
@@ -1185,7 +1117,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 数据准备（使用新函数）
-    data_dir = "/kaggle/input/beiji-landslide-and-dem/Bijie-landslide-dataset/"
+    data_dir = r"F:\zx\datasets\Bijie-landslide-dataset"
     train_dataset, test_dataset = prepare_datasets_with_masks(data_dir, target_size=(256, 256))
 
     # 划分验证集
@@ -1208,37 +1140,17 @@ def main():
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    # 训练模型
-    train_model, history = train_model_multigpu_optimized(
-        model=model,
-        train_loader=train_loader,  # 你的训练数据加载器
-        val_loader=val_loader,  # 你的验证数据加载器
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        num_epochs=100,  # 可以增加epoch
-        device_ids=device_ids
-    )
 
-    # 保存最终模型
-    if device_ids and len(device_ids) > 1:
-        # 多GPU训练时，保存module
-        torch.save(train_model.module.state_dict(), '/kaggle/working/final_deeplabv3+_model.pth')
-    else:
-        torch.save(train_model.state_dict(), '/kaggle/working/final_deeplabv3+_model.pth')
-    print("最终模型已保存为 'final_deeplabv3+_model.pth'")
-    print("训练完成!")
-    # 1. 加载训练好的模型
+    model.load_state_dict(torch.load(r'F:\zx\模型结果及参数\final_deeplabv3+_model.pth', map_location=torch.device('cpu')))
 
-    model.load_state_dict(torch.load('/kaggle/working/final_deeplabv3+_model.pth'))
     model.eval()
 
     # 2. 运行评估
     results = predict_and_evaluate(
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
-        device='cuda',
-        save_dir='predictions_results',
+        device='cpu',
+        save_dir='F:\zx\predictions_results\predictions_results_deeplabv3+',
         multigpu=True
     )
 
