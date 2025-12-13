@@ -765,6 +765,90 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     return results
 
 
+class DEMSlopeAspectExtractor(nn.Module):
+    """从DEM提取坡度和坡向特征"""
+
+    def __init__(self, cell_size=1.0):
+        super(DEMSlopeAspectExtractor, self).__init__()
+        self.cell_size = cell_size
+
+        # Sobel算子用于计算坡度
+        self.sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+        self.sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+    def calculate_slope(self, dem):
+        """计算坡度"""
+        # 计算高程梯度
+        grad_x = F.conv2d(dem, self.sobel_x.to(dem.device), padding=1) / (8 * self.cell_size)
+        grad_y = F.conv2d(dem, self.sobel_y.to(dem.device), padding=1) / (8 * self.cell_size)
+
+        # 计算坡度（弧度）
+        slope = torch.atan(torch.sqrt(grad_x ** 2 + grad_y ** 2))
+
+        return slope
+
+    def calculate_aspect(self, dem):
+        """计算坡向"""
+        # 计算高程梯度
+        grad_x = F.conv2d(dem, self.sobel_x.to(dem.device), padding=1)
+        grad_y = F.conv2d(dem, self.sobel_y.to(dem.device), padding=1)
+
+        # 计算坡向（弧度）
+        aspect = torch.atan2(grad_y, -grad_x)
+
+        # 转换为0-2π范围
+        aspect = torch.where(aspect < 0, aspect + 2 * np.pi, aspect)
+
+        return aspect
+
+    def calculate_curvature(self, dem):
+        """计算曲率"""
+        # 使用Laplacian计算曲率
+        laplacian = torch.tensor([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+        curvature = F.conv2d(dem, laplacian.to(dem.device), padding=1) / (self.cell_size ** 2)
+
+        return curvature
+
+    def forward(self, dem):
+        """提取DEM地形特征"""
+        slope = self.calculate_slope(dem)
+        aspect = self.calculate_aspect(dem)
+        curvature = self.calculate_curvature(dem)
+
+        # 将坡向转换为正弦和余弦分量（便于网络学习）
+        aspect_sin = torch.sin(aspect)
+        aspect_cos = torch.cos(aspect)
+
+        # 标准化
+        slope_norm = (slope - slope.min()) / (slope.max() - slope.min() + 1e-8)
+        curvature_norm = (curvature - curvature.min()) / (curvature.max() - curvature.min() + 1e-8)
+
+        # 拼接所有特征
+        terrain_features = torch.cat([
+            dem,  # 原始高程
+            slope_norm,  # 坡度
+            aspect_sin,  # 坡向正弦
+            aspect_cos,  # 坡向余弦
+            curvature_norm  # 曲率
+        ], dim=1)
+
+        return terrain_features
+
+
 class TraditionalEdgeDetection(nn.Module):
     """传统边缘检测算法：Sobel、Canny-like、Laplacian"""
 
@@ -901,6 +985,7 @@ class TraditionalEdgeDetection(nn.Module):
 
         return fused_edges
 
+
 class RGBEdgeEnhancement(nn.Module):
     """RGB图像边缘增强模块：提取RGB边缘并与原始特征融合"""
 
@@ -948,7 +1033,7 @@ class EdgeAwareFusion(nn.Module):
         self.rgb_edge_extractor = TraditionalEdgeDetection(
             use_sobel=True,
             use_prewitt=True,
-            use_laplacian=False  # 简化版本
+            use_laplacian=True  # 简化版本
         )
 
     def forward(self, rgb_features, dem_features):
@@ -1414,15 +1499,16 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
         super(U2NET_EdgeEnhanced_Traditional, self).__init__()
 
         self.use_edge_fusion = use_edge_fusion
+        self.terrain_extractor = DEMSlopeAspectExtractor()
 
         # 边缘感知融合模块
         if use_edge_fusion:
             self.edge_fusion = EdgeAwareFusion()
-            # 输入通道：RGB(3) + DEM(1) + RGB_Edge(1) = 5
-            input_channels = 5
+            # 输入通道：RGB(3) + DEM(1) + RGB_Edge(1) + DEM地形特征(5) = 10
+            input_channels = 10
         else:
-            # 基本融合：RGB(3) + DEM(1) = 4
-            input_channels = 4
+            # 基本融合：RGB(3) + DEM(1) + DEM地形特征(5) = 9
+            input_channels = 9
 
         # 编码器 (RSU模块)
         self.stage1 = RSU7(input_channels, 32, 64)
@@ -1461,12 +1547,14 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
         self.outconv = nn.Conv2d(6 * n_classes, n_classes, kernel_size=1)
 
     def forward(self, optical, dem):
+        terrain_features = self.terrain_extractor(dem)
+
         # 边缘感知融合
         if self.use_edge_fusion:
-            x = self.edge_fusion(optical, dem)
+            x = torch.cat([self.edge_fusion(optical, dem), terrain_features], dim=1)
         else:
             # 基本融合
-            x = torch.cat([optical, dem], dim=1)
+            x = torch.cat([optical, dem, terrain_features], dim=1)
 
         # 编码路径
         hx1 = self.stage1(x)
@@ -1656,14 +1744,14 @@ def main():
     # 保存最终模型
     if device_ids and len(device_ids) > 1:
         # 多GPU训练时，保存module
-        torch.save(train_model.module.state_dict(), '/kaggle/working/final_U2NET_model.pth')
+        torch.save(train_model.module.state_dict(), '/kaggle/working/final_U2NET_model_Landslide.pth')
     else:
-        torch.save(train_model.state_dict(), '/kaggle/working/final_U2NET_model.pth')
+        torch.save(train_model.state_dict(), '/kaggle/working/final_U2NET_model_Landslide.pth')
     print("最终模型已保存为 'final_U2NET_model.pth'")
     print("训练完成!")
     # 1. 加载训练好的模型
 
-    model.load_state_dict(torch.load('/kaggle/working/final_U2NET_model.pth'))
+    model.load_state_dict(torch.load('/kaggle/working/final_U2NET_model_Landslide.pth'))
     model.eval()
 
     # 2. 运行评估
