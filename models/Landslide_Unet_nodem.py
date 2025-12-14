@@ -77,9 +77,8 @@ def read_dem(file_path):
 
 # 5. 数据集类
 class LandslideDataset(Dataset):
-    def __init__(self, image_paths, dem_paths, mask_paths=None, transform=None, target_size=(256, 256)):
+    def __init__(self, image_paths, mask_paths=None, transform=None, target_size=(256, 256)):
         self.image_paths = [p for p in image_paths if p is not None]
-        self.dem_paths = [p for p in dem_paths if p is not None]
 
         # 确保mask_paths列表长度与image_paths一致
         if mask_paths is None:
@@ -102,9 +101,6 @@ class LandslideDataset(Dataset):
         else:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # 读取DEM
-        dem_path = self.dem_paths[idx]
-        dem = read_dem(dem_path)
 
         # 读取或创建掩膜
         mask_path = self.mask_paths[idx]
@@ -121,19 +117,9 @@ class LandslideDataset(Dataset):
 
         # 调整大小
         img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
-        dem = cv2.resize(dem, self.target_size, interpolation=cv2.INTER_NEAREST)
         mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
 
-        # 归一化DEM
-        dem_min, dem_max = dem.min(), dem.max()
-        if dem_max > dem_min:
-            dem = (dem - dem_min) / (dem_max - dem_min + 1e-8)
-        else:
-            dem = np.zeros_like(dem)
-
-        # 合并为4通道
-        dem = np.expand_dims(dem, axis=-1)
-        combined = np.concatenate([img, dem], axis=-1)
+        combined = img
 
         # 应用变换
         if self.transform:
@@ -143,13 +129,12 @@ class LandslideDataset(Dataset):
 
         # 分离通道
         optical = combined[:3, :, :]
-        dem = combined[3:, :, :]
         mask = mask.unsqueeze(0).float() / 255.0
 
         # 添加一个标志位：是否为滑坡样本
         is_landslide = 1.0 if self.mask_paths[idx] is not None else 0.0
 
-        return optical, dem, mask, is_landslide, img_path
+        return optical, mask, is_landslide, img_path
 
 
 # 6. 数据准备函数 (保持不变，但移除 rasterio 依赖)
@@ -275,7 +260,6 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
     # 创建数据集
     train_dataset = LandslideDataset(
         image_paths=train_imgs,
-        dem_paths=train_dems,
         mask_paths=train_masks,
         transform=train_transform,
         target_size=target_size
@@ -283,7 +267,6 @@ def prepare_datasets_with_masks(data_dir, target_size=(256, 256), test_size=0.2)
 
     test_dataset = LandslideDataset(
         image_paths=test_imgs,
-        dem_paths=test_dems,
         mask_paths=test_masks,
         transform=val_transform,
         target_size=target_size
@@ -402,19 +385,18 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
 
         optimizer.zero_grad()
 
-        for batch_idx, (optical, dem, mask, is_landslide, _) in pbar:
+        for batch_idx, (optical, mask, is_landslide, _) in pbar:
             batch_count += 1
 
             optical = optical.to(device, non_blocking=True)
-            dem = dem.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
 
             # 混合精度前向传播
             with autocast():
-                outputs = model(optical, dem)
+                outputs = model(optical)
 
                 if hasattr(criterion, '__code__') and criterion.__code__.co_argcount > 2:
-                    loss = criterion(outputs, mask, dem)
+                    loss = criterion(outputs, mask)
                 else:
                     loss = criterion(outputs, mask)
 
@@ -464,15 +446,15 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
         # 验证阶段不使用混合精度
         with torch.no_grad(), autocast(enabled=False):
             pbar = tqdm(val_loader, desc='Validation')
-            for optical, dem, mask, is_landslide, _ in pbar:
+            for optical, mask, is_landslide, _ in pbar:
                 optical = optical.to(device, non_blocking=True)
-                dem = dem.to(device, non_blocking=True)
+
                 mask = mask.to(device, non_blocking=True)
 
-                outputs = model(optical, dem)
+                outputs = model(optical)
 
                 if hasattr(criterion, '__code__') and criterion.__code__.co_argcount > 2:
-                    loss = criterion(outputs, mask, dem)
+                    loss = criterion(outputs, mask)
                 else:
                     loss = criterion(outputs, mask)
 
@@ -575,23 +557,23 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     with torch.no_grad():
         for i, batch in enumerate(tqdm(test_loader, desc='Testing')):
             # ===== 修改这里：支持多种数据格式 =====
-            if len(batch) == 4:
-                # 格式: (optical, dem, mask, img_paths)
-                optical, dem, mask, img_paths = batch
+            if len(batch) == 3:
+                # 格式: (optical, mask, img_paths)
+                optical, mask, img_paths = batch
                 is_landslide = None
-            elif len(batch) == 5:
-                # 格式: (optical, dem, mask, is_landslide, img_paths)
-                optical, dem, mask, is_landslide, img_paths = batch
+            elif len(batch) == 4:
+                # 格式: (optical, mask, is_landslide, img_paths)
+                optical, mask, is_landslide, img_paths = batch
             else:
                 raise ValueError(f"意外的batch长度: {len(batch)}")
             # ===== 修改结束 =====
 
             optical = optical.to(device)
-            dem = dem.to(device)
+
             mask = mask.cpu()  # 在CPU上处理mask
 
             # 修改点1: EarlyFusionNet直接输出logits
-            outputs = model(optical, dem)
+            outputs = model(optical)
 
             # 修改点2: 通过sigmoid得到概率，然后阈值化
             pred_probs = torch.sigmoid(outputs).cpu()
@@ -631,10 +613,7 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
                                 axs[0].set_title('Original Image')
                                 axs[0].axis('off')
 
-                                # DEM数据（可选）
-                                axs[1].imshow(dem[j].squeeze().cpu().numpy(), cmap='terrain')
-                                axs[1].set_title('DEM Data')
-                                axs[1].axis('off')
+
 
                                 # 真实掩膜
                                 axs[2].imshow(mask[j].squeeze().numpy(), cmap='gray')
@@ -1491,16 +1470,14 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
         super(U2NET_EdgeEnhanced_Traditional, self).__init__()
 
         self.use_edge_fusion = use_edge_fusion
-        self.terrain_extractor = DEMSlopeAspectExtractor()
-
         # 边缘感知融合模块
         if use_edge_fusion:
             self.edge_fusion = EdgeAwareFusion()
-            # 输入通道：RGB(3) + RGB_Edge(1) + DEM1(2) = 6
-            input_channels = 6
+            # 输入通道：RGB(3) + RGB_Edge(1)
+            input_channels = 4
         else:
-            # 基本融合：RGB(3) + DEM地形特征(2) = 5
-            input_channels = 5
+            # 基本融合：RGB(3)
+            input_channels = 3
 
         # 编码器 (RSU模块)
         self.stage1 = RSU7(input_channels, 32, 64)
@@ -1538,15 +1515,14 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
         # 最终融合层
         self.outconv = nn.Conv2d(6 * n_classes, n_classes, kernel_size=1)
 
-    def forward(self, optical, dem):
-        terrain_features = self.terrain_extractor(dem)
+    def forward(self, optical):
 
         # 边缘感知融合
         if self.use_edge_fusion:
-            x = torch.cat([self.edge_fusion(optical), terrain_features], dim=1)
+            x = self.edge_fusion(optical)
         else:
             # 基本融合
-            x = torch.cat([optical, terrain_features], dim=1)
+            x = optical
 
         # 编码路径
         hx1 = self.stage1(x)

@@ -1007,7 +1007,7 @@ class EdgeAwareFusion(nn.Module):
         # 提取RGB边缘
         self.rgb_edge_extractor = TraditionalEdgeDetection(
             use_sobel=True,
-            use_prewitt=True,
+            use_prewitt=False,
             use_laplacian=False  # 简化版本
         )
 
