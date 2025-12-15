@@ -46,35 +46,6 @@ def setup_multigpu():
     else:
         print("单GPU训练")
         return None
-
-
-# 4. DEM 读取函数 (OpenCV 替代 rasterio)
-def read_dem(file_path):
-    """使用 OpenCV 读取 DEM 文件，兼容多种格式"""
-    dem = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
-
-    # 尝试替代扩展名
-    if dem is None:
-        base, ext = os.path.splitext(file_path)
-        possible_exts = ['.tif', '.tiff', '.png', '.jpg', '.jpeg']
-        for new_ext in possible_exts:
-            alt_path = base + new_ext
-            if os.path.exists(alt_path):
-                dem = cv2.imread(alt_path, cv2.IMREAD_UNCHANGED)
-                if dem is not None:
-                    break
-
-    # 处理读取失败
-    if dem is None:
-        return np.zeros((256, 256), dtype=np.float32)
-
-    # 确保单通道
-    if len(dem.shape) == 3:
-        dem = dem[:, :, 0]  # 取第一个通道
-
-    return dem.astype(np.float32)
-
-
 # 5. 数据集类
 class LandslideDataset(Dataset):
     def __init__(self, image_paths, mask_paths=None, transform=None, target_size=(256, 256)):
@@ -102,7 +73,6 @@ class LandslideDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-        # 读取或创建掩膜
         mask_path = self.mask_paths[idx]
         if mask_path is not None and os.path.exists(mask_path):
             # 有真实mask：读取并二值化
@@ -119,7 +89,9 @@ class LandslideDataset(Dataset):
         img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
 
-        combined = img
+
+
+        combined = np.concatenate([img], axis=-1)
 
         # 应用变换
         if self.transform:
@@ -385,7 +357,7 @@ def train_model_multigpu_optimized(model, train_loader, val_loader, criterion, o
 
         optimizer.zero_grad()
 
-        for batch_idx, (optical, mask, is_landslide, _) in pbar:
+        for batch_idx, (optical,  mask, is_landslide, _) in pbar:
             batch_count += 1
 
             optical = optical.to(device, non_blocking=True)
@@ -534,8 +506,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     from tqdm import tqdm
     from sklearn.metrics import jaccard_score, precision_score, recall_score, f1_score
 
-    os.makedirs(save_dir, exist_ok=True)
-
     if multigpu and torch.cuda.device_count() > 1:
         device_ids = list(range(torch.cuda.device_count()))
         print(f"使用多GPU评估: {device_ids}")
@@ -558,11 +528,11 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
         for i, batch in enumerate(tqdm(test_loader, desc='Testing')):
             # ===== 修改这里：支持多种数据格式 =====
             if len(batch) == 3:
-                # 格式: (optical, mask, img_paths)
+                # 格式: (optical, dem, mask, img_paths)
                 optical, mask, img_paths = batch
                 is_landslide = None
             elif len(batch) == 4:
-                # 格式: (optical, mask, is_landslide, img_paths)
+                # 格式: (optical, dem, mask, is_landslide, img_paths)
                 optical, mask, is_landslide, img_paths = batch
             else:
                 raise ValueError(f"意外的batch长度: {len(batch)}")
@@ -591,10 +561,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
 
                 # 保存原始预测（浮点数概率）
                 pred_prob = pred_probs[j].squeeze().numpy()
-                np.save(os.path.join(save_dir, f'prob_{base_name}.npy'), pred_prob)
-
-                # 保存二值化预测
-                cv2.imwrite(os.path.join(save_dir, f'pred_{base_name}.png'), pred_mask_uint8)
 
                 # 保存可视化结果（如果有真实掩膜）
                 if mask[j].sum() > 0:
@@ -613,8 +579,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
                                 axs[0].set_title('Original Image')
                                 axs[0].axis('off')
 
-
-
                                 # 真实掩膜
                                 axs[2].imshow(mask[j].squeeze().numpy(), cmap='gray')
                                 axs[2].set_title('Ground Truth')
@@ -626,8 +590,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
                                 axs[3].axis('off')
 
                                 plt.tight_layout()
-                                plt.savefig(os.path.join(save_dir, f'vis_{base_name}.png'),
-                                            bbox_inches='tight', dpi=100)
                                 plt.close()
                     except Exception as e:
                         print(f"可视化 {img_name} 时出错: {e}")
@@ -744,309 +706,70 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     return results
 
 
-class DEMSlopeAspectExtractor(nn.Module):
-    """从DEM提取坡度和坡向特征"""
+def visualize_predictions_comparison(model, test_loader, device='cuda', num_samples=5):
+    """
+    可视化预测对比（单独函数，更清晰）
+    """
+    import matplotlib.pyplot as plt
 
-    def __init__(self, cell_size=1.0):
-        super(DEMSlopeAspectExtractor, self).__init__()
-        self.cell_size = cell_size
+    model.eval()
 
-        # Sobel算子用于计算坡度
-        self.sobel_x = torch.tensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    with torch.no_grad():
+        for i, (optical, dem, mask, img_paths) in enumerate(test_loader):
+            if i >= 1:  # 只取第一个batch
+                break
 
-        self.sobel_y = torch.tensor([
-            [-1, -2, -1],
-            [0, 0, 0],
-            [1, 2, 1]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-
-    def calculate_slope(self, dem):
-        """计算坡度"""
-        # 计算高程梯度
-        grad_x = F.conv2d(dem, self.sobel_x.to(dem.device), padding=1) / (8 * self.cell_size)
-        grad_y = F.conv2d(dem, self.sobel_y.to(dem.device), padding=1) / (8 * self.cell_size)
-
-        # 计算坡度（弧度）
-        slope = torch.atan(torch.sqrt(grad_x ** 2 + grad_y ** 2))
-
-        return slope
-
-    def calculate_aspect(self, dem):
-        """计算坡向"""
-        # 计算高程梯度
-        grad_x = F.conv2d(dem, self.sobel_x.to(dem.device), padding=1)
-        grad_y = F.conv2d(dem, self.sobel_y.to(dem.device), padding=1)
-
-        # 计算坡向（弧度）
-        aspect = torch.atan2(grad_y, -grad_x)
-
-        # 转换为0-2π范围
-        aspect = torch.where(aspect < 0, aspect + 2 * np.pi, aspect)
-
-        return aspect
-
-    def calculate_curvature(self, dem):
-        """计算曲率"""
-        # 使用Laplacian计算曲率
-        laplacian = torch.tensor([
-            [0, 1, 0],
-            [1, -4, 1],
-            [0, 1, 0]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-
-        curvature = F.conv2d(dem, laplacian.to(dem.device), padding=1) / (self.cell_size ** 2)
-
-        return curvature
-
-    def forward(self, dem):
-        """提取DEM地形特征"""
-        slope = self.calculate_slope(dem)
-        aspect = self.calculate_aspect(dem)
-        curvature = self.calculate_curvature(dem)
-
-        # 标准化
-        slope_norm = (slope - slope.min()) / (slope.max() - slope.min() + 1e-8)
-        curvature_norm = (curvature - curvature.min()) / (curvature.max() - curvature.min() + 1e-8)
-
-        # 拼接所有特征
-        terrain_features = torch.cat([
-            dem,  # 原始高程
-            slope_norm,  # 坡度
-        ], dim=1)
-
-        return terrain_features
+            optical = optical.to(device)
 
 
-class TraditionalEdgeDetection(nn.Module):
-    """传统边缘检测算法：Sobel、Canny-like、Laplacian"""
+            outputs = model(optical)
+            pred_probs = torch.sigmoid(outputs).cpu()
 
-    def __init__(self, use_sobel=True, use_prewitt=True, use_laplacian=True):
-        super(TraditionalEdgeDetection, self).__init__()
+            # 显示前几个样本
+            num_show = min(num_samples, len(optical))
 
-        self.use_sobel = use_sobel
-        self.use_prewitt = use_prewitt
-        self.use_laplacian = use_laplacian
+            fig, axes = plt.subplots(num_show, 4, figsize=(16, num_show * 4))
+            if num_show == 1:
+                axes = axes.reshape(1, -1)
 
-        # 创建固定的卷积核（不参与训练）
-        # 注意：这里不直接存储为属性，而是在需要时动态创建
-        self._sobel_x_kernel = None
-        self._sobel_y_kernel = None
-        self._prewitt_x_kernel = None
-        self._prewitt_y_kernel = None
-        self._laplacian_kernel = None
-
-    def _create_sobel_x_kernel(self, device):
-        """创建Sobel X方向卷积核"""
-        kernel = torch.tensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        return kernel
-
-    def _create_sobel_y_kernel(self, device):
-        """创建Sobel Y方向卷积核"""
-        kernel = torch.tensor([
-            [-1, -2, -1],
-            [0, 0, 0],
-            [1, 2, 1]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        return kernel
-
-    def _create_prewitt_x_kernel(self, device):
-        """创建Prewitt X方向卷积核"""
-        kernel = torch.tensor([
-            [-1, 0, 1],
-            [-1, 0, 1],
-            [-1, 0, 1]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        return kernel
-
-    def _create_prewitt_y_kernel(self, device):
-        """创建Prewitt Y方向卷积核"""
-        kernel = torch.tensor([
-            [-1, -1, -1],
-            [0, 0, 0],
-            [1, 1, 1]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        return kernel
-
-    def _create_laplacian_kernel(self, device):
-        """创建Laplacian卷积核（4邻域）"""
-        kernel = torch.tensor([
-            [0, -1, 0],
-            [-1, 4, -1],
-            [0, -1, 0]
-        ], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-        return kernel
-
-    def _get_kernel(self, kernel_type, device):
-        """获取指定类型的卷积核，确保在正确的设备上"""
-        if kernel_type == 'sobel_x':
-            if self._sobel_x_kernel is None or self._sobel_x_kernel.device != device:
-                self._sobel_x_kernel = self._create_sobel_x_kernel(device)
-            return self._sobel_x_kernel
-        elif kernel_type == 'sobel_y':
-            if self._sobel_y_kernel is None or self._sobel_y_kernel.device != device:
-                self._sobel_y_kernel = self._create_sobel_y_kernel(device)
-            return self._sobel_y_kernel
-        elif kernel_type == 'prewitt_x':
-            if self._prewitt_x_kernel is None or self._prewitt_x_kernel.device != device:
-                self._prewitt_x_kernel = self._create_prewitt_x_kernel(device)
-            return self._prewitt_x_kernel
-        elif kernel_type == 'prewitt_y':
-            if self._prewitt_y_kernel is None or self._prewitt_y_kernel.device != device:
-                self._prewitt_y_kernel = self._create_prewitt_y_kernel(device)
-            return self._prewitt_y_kernel
-        elif kernel_type == 'laplacian':
-            if self._laplacian_kernel is None or self._laplacian_kernel.device != device:
-                self._laplacian_kernel = self._create_laplacian_kernel(device)
-            return self._laplacian_kernel
-        else:
-            raise ValueError(f"Unknown kernel type: {kernel_type}")
-
-    def _apply_kernel(self, x, kernel_type):
-        """应用卷积核（处理多通道输入）"""
-        batch_size, channels, height, width = x.shape
-        device = x.device
-
-        # 获取对应设备上的卷积核
-        kernel_base = self._get_kernel(kernel_type, device)
-
-        # 为每个通道复制卷积核
-        kernel = kernel_base.repeat(channels, 1, 1, 1)
-
-        # 分组卷积，每个通道独立处理
-        edges = F.conv2d(x, kernel, padding=1, groups=channels)
-
-        return edges
-
-    def forward(self, x):
-        """提取多尺度边缘特征"""
-        edge_maps = []
-
-        # Sobel边缘检测
-        if self.use_sobel:
-            sobel_x = self._apply_kernel(x, 'sobel_x')
-            sobel_y = self._apply_kernel(x, 'sobel_y')
-            sobel_magnitude = torch.sqrt(sobel_x ** 2 + sobel_y ** 2 + 1e-8)
-            edge_maps.append(sobel_magnitude)
-
-        # Prewitt边缘检测
-        if self.use_prewitt:
-            prewitt_x = self._apply_kernel(x, 'prewitt_x')
-            prewitt_y = self._apply_kernel(x, 'prewitt_y')
-            prewitt_magnitude = torch.sqrt(prewitt_x ** 2 + prewitt_y ** 2 + 1e-8)
-            edge_maps.append(prewitt_magnitude)
-
-        # Laplacian边缘检测
-        if self.use_laplacian:
-            laplacian = self._apply_kernel(x, 'laplacian')
-            laplacian_abs = torch.abs(laplacian)  # 取绝对值
-            edge_maps.append(laplacian_abs)
-
-        # 融合所有边缘特征
-        if edge_maps:
-            fused_edges = torch.stack(edge_maps, dim=1).mean(dim=1)
-        else:
-            fused_edges = torch.zeros_like(x)
-
-        return fused_edges
+            for idx in range(num_show):
+                # 光学图像
+                axes[idx, 0].imshow(optical[idx].cpu().permute(1, 2, 0).numpy())
+                axes[idx, 0].set_title('Optical Image')
+                axes[idx, 0].axis('off')
 
 
-class RGBEdgeEnhancement(nn.Module):
-    """RGB图像边缘增强模块：提取RGB边缘并与原始特征融合"""
+                # 真实掩膜
+                if mask[idx].sum() > 0:
+                    axes[idx, 2].imshow(mask[idx].squeeze().numpy(), cmap='gray')
+                axes[idx, 2].set_title('Ground Truth')
+                axes[idx, 2].axis('off')
 
-    def __init__(self, edge_weight=0.3):
-        super(RGBEdgeEnhancement, self).__init__()
+                # 预测结果
+                pred_prob = pred_probs[idx].squeeze().numpy()
+                im = axes[idx, 3].imshow(pred_prob, cmap='jet', vmin=0, vmax=1)
+                axes[idx, 3].set_title('Prediction')
+                axes[idx, 3].axis('off')
 
-        self.edge_detector = TraditionalEdgeDetection(
-            use_sobel=True,
-            use_prewitt=True,
-            use_laplacian=True
-        )
+                # 添加颜色条
+                plt.colorbar(im, ax=axes[idx, 3], fraction=0.046, pad=0.04)
 
-        # 边缘权重（控制边缘信息的重要性）
-        self.edge_weight = edge_weight
+            plt.tight_layout()
+            plt.savefig('predictions_comparison.png', dpi=150, bbox_inches='tight')
+            plt.show()
+            break
 
-        # 简单的融合层（没有可学习参数）
-        self.fusion_alpha = nn.Parameter(torch.tensor(0.5), requires_grad=False)
-
-    def forward(self, rgb_features):
-        """
-        Args:
-            rgb_features: RGB特征图 [B, C, H, W]
-        Returns:
-            增强后的特征图
-        """
-        # 提取RGB边缘
-        rgb_edges = self.edge_detector(rgb_features)
-
-        # 标准化边缘特征（0-1范围）
-        rgb_edges_normalized = (rgb_edges - rgb_edges.min()) / (rgb_edges.max() - rgb_edges.min() + 1e-8)
-
-        # 增强原始特征：原始特征 + 边缘特征
-        enhanced_features = rgb_features + self.edge_weight * rgb_edges_normalized
-
-        return enhanced_features
-
-
-class EdgeAwareFusion(nn.Module):
-    """边缘感知的特征融合模块：将RGB边缘与DEM特征融合"""
-
-    def __init__(self):
-        super(EdgeAwareFusion, self).__init__()
-
-        # 提取RGB边缘
-        self.rgb_edge_extractor = TraditionalEdgeDetection(
-            use_sobel=True,
-            use_prewitt=False,
-            use_laplacian=False  # 简化版本
-        )
-
-    def forward(self, rgb_features):
-        """
-        Args:
-            rgb_features: RGB特征 [B, 3, H, W]
-            dem_features: DEM特征 [B, 1, H, W]
-        Returns:
-            融合后的特征 [B, 4, H, W]
-        """
-        # 提取RGB边缘
-        rgb_edges = self.rgb_edge_extractor(rgb_features)
-
-        # 标准化RGB边缘
-        rgb_edges_normalized = (rgb_edges - rgb_edges.min()) / (rgb_edges.max() - rgb_edges.min() + 1e-8)
-
-        # 将RGB边缘作为额外的通道
-        rgb_edges_mean = rgb_edges.mean(dim=1, keepdim=True)  # 将3个通道合并为1个
-        rgb_edges_normalized = (rgb_edges_mean - rgb_edges_mean.min()) / (
-                rgb_edges_mean.max() - rgb_edges_mean.min() + 1e-8)
-        # 融合方式：RGB(3) + DEM(1) + RGB_Edge(1) = 5个通道
-        fused_features = torch.cat([
-            rgb_features,  # 3个通道
-            rgb_edges_normalized  # 1个通道（边缘信息）
-        ], dim=1)
-
-        return fused_features
 
 
 class RSU7(nn.Module):
-    """RSU-7模块: 高度为7的残差U块（添加边缘信息输入）"""
+    """RSU-7模块: 高度为7的残差U块"""
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, edge_channels=0):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU7, self).__init__()
         self.out_ch = out_ch
 
-        # 如果包含边缘通道，调整输入通道数
-        total_in_ch = in_ch + edge_channels
-
         # 编码器部分
-        self.conv0 = nn.Conv2d(total_in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
 
         self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -1096,16 +819,12 @@ class RSU7(nn.Module):
 
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, edge_map=None):
-        # 如果提供了边缘图，与输入拼接
-        if edge_map is not None:
-            x = torch.cat([x, edge_map], dim=1)
-
-        # 保存原始输入尺寸
-        input_size = x.shape[2:]
+    def forward(self, x):
+        # 保存原始输入用于残差连接
+        x_input = x
 
         # 第一层卷积
-        hx = self.conv0(x)
+        hx = self.conv0(x_input)
         hx_in = hx  # 保存用于残差连接
 
         # 编码器路径
@@ -1146,23 +865,25 @@ class RSU7(nn.Module):
 
         hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
 
-        # 确保输出和输入尺寸一致
-        if hx1d.shape[2:] != input_size:
-            hx1d = F.interpolate(hx1d, size=input_size, mode='bilinear', align_corners=True)
+        # 确保hx1d和hx_in大小一致，如果不一致则调整hx_in
+        if hx1d.shape != hx_in.shape:
+            # 调整hx_in的大小以匹配hx1d
+            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
+        else:
+            hx_in_adjusted = hx_in
 
         # 残差连接
-        return hx1d + hx_in
+        return hx1d + hx_in_adjusted
 
 
 class RSU6(nn.Module):
-    """RSU-6模块: 高度为6的残差U块（集成边缘增强）"""
+    """RSU-6模块: 高度为6的残差U块"""
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, edge_channels=0):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU6, self).__init__()
         self.out_ch = out_ch
 
-        total_in_ch = in_ch + edge_channels
-        self.conv0 = nn.Conv2d(total_in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
 
         self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -1205,11 +926,11 @@ class RSU6(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # 保存原始输入尺寸
-        input_size = x.shape[2:]
+        # 保存原始输入用于残差连接
+        x_input = x
 
         # 第一层卷积
-        hx = self.conv0(x)
+        hx = self.conv0(x_input)
         hx_in = hx  # 保存用于残差连接
 
         hx1 = self.relu(self.bn1(self.conv1(hx)))
@@ -1242,24 +963,24 @@ class RSU6(nn.Module):
 
         hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
 
-        # 确保输出和输入尺寸一致
-        if hx1d.shape[2:] != input_size:
-            hx1d = F.interpolate(hx1d, size=input_size, mode='bilinear', align_corners=True)
+        # 确保hx1d和hx_in大小一致
+        if hx1d.shape != hx_in.shape:
+            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
+        else:
+            hx_in_adjusted = hx_in
 
         # 残差连接
-        return hx1d + hx_in
+        return hx1d + hx_in_adjusted
 
 
 class RSU5(nn.Module):
-    """RSU-5模块: 高度为5的残差U块（集成边缘增强）"""
+    """RSU-5模块: 高度为5的残差U块"""
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, edge_channels=0):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU5, self).__init__()
         self.out_ch = out_ch
 
-        total_in_ch = in_ch + edge_channels
-
-        self.conv0 = nn.Conv2d(total_in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
 
         self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -1295,15 +1016,14 @@ class RSU5(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # 保存原始输入尺寸
-        input_size = x.shape[2:]
+        # 保存原始输入用于残差连接
+        x_input = x
 
         # 第一层卷积
-        hx = self.conv0(x)
+        hx = self.conv0(x_input)
         hx_in = hx  # 保存用于残差连接
 
         hx1 = self.relu(self.bn1(self.conv1(hx)))
-
         hx = self.pool1(hx1)
 
         hx2 = self.relu(self.bn2(self.conv2(hx)))
@@ -1327,23 +1047,24 @@ class RSU5(nn.Module):
 
         hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
 
-        # 确保输出和输入尺寸一致
-        if hx1d.shape[2:] != input_size:
-            hx1d = F.interpolate(hx1d, size=input_size, mode='bilinear', align_corners=True)
+        # 确保hx1d和hx_in大小一致
+        if hx1d.shape != hx_in.shape:
+            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
+        else:
+            hx_in_adjusted = hx_in
 
         # 残差连接
-        return hx1d + hx_in
+        return hx1d + hx_in_adjusted
 
 
 class RSU4(nn.Module):
-    """RSU-4模块: 高度为4的残差U块（集成边缘增强）"""
+    """RSU-4模块: 高度为4的残差U块"""
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, edge_channels=0):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU4, self).__init__()
         self.out_ch = out_ch
-        total_in_ch = in_ch + edge_channels
 
-        self.conv0 = nn.Conv2d(total_in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
 
         self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -1372,15 +1093,14 @@ class RSU4(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # 保存原始输入尺寸
-        input_size = x.shape[2:]
+        # 保存原始输入用于残差连接
+        x_input = x
 
         # 第一层卷积
-        hx = self.conv0(x)
+        hx = self.conv0(x_input)
         hx_in = hx  # 保存用于残差连接
 
         hx1 = self.relu(self.bn1(self.conv1(hx)))
-
         hx = self.pool1(hx1)
 
         hx2 = self.relu(self.bn2(self.conv2(hx)))
@@ -1398,23 +1118,24 @@ class RSU4(nn.Module):
 
         hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
 
-        # 确保输出和输入尺寸一致
-        if hx1d.shape[2:] != input_size:
-            hx1d = F.interpolate(hx1d, size=input_size, mode='bilinear', align_corners=True)
+        # 确保hx1d和hx_in大小一致
+        if hx1d.shape != hx_in.shape:
+            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
+        else:
+            hx_in_adjusted = hx_in
 
         # 残差连接
-        return hx1d + hx_in
+        return hx1d + hx_in_adjusted
 
 
 class RSU4F(nn.Module):
-    """RSU-4F模块: 无下采样的RSU-4（使用空洞卷积，集成边缘增强）"""
+    """RSU-4F模块: 无下采样的RSU-4（使用空洞卷积）"""
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, edge_channels=0):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU4F, self).__init__()
         self.out_ch = out_ch
-        total_in_ch = in_ch + edge_channels
 
-        self.conv0 = nn.Conv2d(total_in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
 
         self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -1449,7 +1170,6 @@ class RSU4F(nn.Module):
         hx_in = hx  # 保存用于残差连接
 
         hx1 = self.relu(self.bn1(self.conv1(hx)))
-
         hx2 = self.relu(self.bn2(self.conv2(hx1)))
         hx3 = self.relu(self.bn3(self.conv3(hx2)))
         hx4 = self.relu(self.bn4(self.conv4(hx3)))
@@ -1463,24 +1183,14 @@ class RSU4F(nn.Module):
         return hx1d + hx_in
 
 
-class U2NET_EdgeEnhanced_Traditional(nn.Module):
-    """U^2-Net模型 - 传统边缘增强版本，针对滑坡语义分割优化"""
+class U2NET(nn.Module):
+    """U^2-Net模型 - 早期融合版本，输入输出与原始U-Net保持一致"""
 
-    def __init__(self, n_classes=1, use_edge_fusion=True):
-        super(U2NET_EdgeEnhanced_Traditional, self).__init__()
-
-        self.use_edge_fusion = use_edge_fusion
-        # 边缘感知融合模块
-        if use_edge_fusion:
-            self.edge_fusion = EdgeAwareFusion()
-            # 输入通道：RGB(3) + RGB_Edge(1)
-            input_channels = 4
-        else:
-            # 基本融合：RGB(3)
-            input_channels = 3
+    def __init__(self, n_channels=4, n_classes=1):
+        super(U2NET, self).__init__()
 
         # 编码器 (RSU模块)
-        self.stage1 = RSU7(input_channels, 32, 64)
+        self.stage1 = RSU7(n_channels, 32, 64)
         self.pool12 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
 
         self.stage2 = RSU6(64, 32, 128)
@@ -1515,14 +1225,9 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
         # 最终融合层
         self.outconv = nn.Conv2d(6 * n_classes, n_classes, kernel_size=1)
 
-    def forward(self, optical):
-
-        # 边缘感知融合
-        if self.use_edge_fusion:
-            x = self.edge_fusion(optical)
-        else:
-            # 基本融合
-            x = optical
+    def forward(self, optical,):
+        # 早期融合: 在通道维度拼接
+        x = torch.cat([optical], dim=1)
 
         # 编码路径
         hx1 = self.stage1(x)
@@ -1581,21 +1286,13 @@ class U2NET_EdgeEnhanced_Traditional(nn.Module):
 
         return d0
 
-    def extract_rgb_edges(self, optical):
-        """提取RGB边缘图（用于可视化）"""
-        edge_detector = TraditionalEdgeDetection(
-            use_sobel=True,
-            use_prewitt=True,
-            use_laplacian=False
-        )
-        return edge_detector(optical)
 
 
 def get_simple_training_config():
     """获取简单训练配置"""
 
     # 1. 创建简单模型
-    model = U2NET_EdgeEnhanced_Traditional(n_classes=1, use_edge_fusion=True)
+    model = U2NET(n_channels=3, n_classes=1).to('cuda')
 
     # 2. 使用标准损失函数（先排除复杂的损失函数）
     def simple_loss(pred, target):
@@ -1657,6 +1354,53 @@ def get_simple_training_config():
     return model, combined_loss, optimizer, scheduler
 
 
+def load_model_with_multigpu_support(model, model_path):
+    """
+    加载模型，自动处理多GPU训练的权重
+
+    参数:
+        model: 模型实例
+        model_path: 权重文件路径
+
+    返回:
+        model: 加载权重后的模型
+    """
+    # 加载权重
+    checkpoint = torch.load(model_path, map_location='cpu')
+
+    # 提取state_dict
+    if isinstance(checkpoint, dict):
+        # 检查是完整checkpoint还是直接state_dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    # 检查是否是多GPU权重
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        print("🔄 处理多GPU训练权重...")
+        # 移除'module.'前缀
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                new_key = key[7:]  # 去掉'module.'
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        state_dict = new_state_dict
+
+    # 加载权重
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    print(f" 模型权重已加载（{len(state_dict)}个参数）")
+    return model
+
+
 def main():
     """主训练函数"""
 
@@ -1692,13 +1436,34 @@ def main():
     print(f"测试集: {len(test_subset)} 样本")
 
     # 创建数据加载器
-    batch_size = 8
+    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
+    # 训练模型
+    train_model, history = train_model_multigpu_optimized(
+        model=model,
+        train_loader=train_loader,  # 你的训练数据加载器
+        val_loader=val_loader,  # 你的验证数据加载器
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        num_epochs=100,  # 可以增加epoch
+        device_ids=device_ids
+    )
 
-    model.load_state_dict(torch.load('/kaggle/working/final_U2NET_model_Landslide.pth'))
+    # 保存最终模型
+    if device_ids and len(device_ids) > 1:
+        # 多GPU训练时，保存module
+        torch.save(train_model.module.state_dict(), '/kaggle/working/final_U2NET_model.pth')
+    else:
+        torch.save(train_model.state_dict(), '/kaggle/working/final_U2NET_model.pth')
+    print("最终模型已保存为 'final_U2NET_model.pth'")
+    print("训练完成!")
+    # 1. 加载训练好的模型
+
+    model.load_state_dict(torch.load('/kaggle/working/final_U2NET_model.pth'))
     model.eval()
 
     # 2. 运行评估
