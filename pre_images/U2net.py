@@ -1312,8 +1312,8 @@ def main():
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    model.load_state_dict(torch.load(r'D:\ly\landsint\result\final_U2NET_model.pth', map_location=torch.device('cpu')))
-
+    # model.load_state_dict(torch.load(r'D:\ly\landsint\result\final_U2NET_model.pth', map_location=torch.device('cpu')))
+    model.load_state_dict(torch.load(r'D:\ly\landsint\result\final_U2NET_model (1).pth', map_location=torch.device('cpu')))
     model.eval()
 
     # 2. 运行评估
@@ -1321,7 +1321,8 @@ def main():
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
         device='cpu',
-        save_dir=r'D:\ly\landsint\result\predictions_results_U2net',
+        # save_dir=r'D:\ly\landsint\result\predictions_results_U2net',
+        save_dir=r'D:\ly\landsint\result\predictions_results_U2net2',
         multigpu=True
     )
 

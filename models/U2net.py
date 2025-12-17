@@ -757,63 +757,6 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     return results
 
 
-def visualize_predictions_comparison(model, test_loader, device='cuda', num_samples=5):
-    """
-    可视化预测对比（单独函数，更清晰）
-    """
-    import matplotlib.pyplot as plt
-
-    model.eval()
-
-    with torch.no_grad():
-        for i, (optical, dem, mask, img_paths) in enumerate(test_loader):
-            if i >= 1:  # 只取第一个batch
-                break
-
-            optical = optical.to(device)
-            dem = dem.to(device)
-
-            outputs = model(optical, dem)
-            pred_probs = torch.sigmoid(outputs).cpu()
-
-            # 显示前几个样本
-            num_show = min(num_samples, len(optical))
-
-            fig, axes = plt.subplots(num_show, 4, figsize=(16, num_show * 4))
-            if num_show == 1:
-                axes = axes.reshape(1, -1)
-
-            for idx in range(num_show):
-                # 光学图像
-                axes[idx, 0].imshow(optical[idx].cpu().permute(1, 2, 0).numpy())
-                axes[idx, 0].set_title('Optical Image')
-                axes[idx, 0].axis('off')
-
-                # DEM数据
-                axes[idx, 1].imshow(dem[idx].cpu().squeeze().numpy(), cmap='terrain')
-                axes[idx, 1].set_title('DEM Data')
-                axes[idx, 1].axis('off')
-
-                # 真实掩膜
-                if mask[idx].sum() > 0:
-                    axes[idx, 2].imshow(mask[idx].squeeze().numpy(), cmap='gray')
-                axes[idx, 2].set_title('Ground Truth')
-                axes[idx, 2].axis('off')
-
-                # 预测结果
-                pred_prob = pred_probs[idx].squeeze().numpy()
-                im = axes[idx, 3].imshow(pred_prob, cmap='jet', vmin=0, vmax=1)
-                axes[idx, 3].set_title('Prediction')
-                axes[idx, 3].axis('off')
-
-                # 添加颜色条
-                plt.colorbar(im, ax=axes[idx, 3], fraction=0.046, pad=0.04)
-
-            plt.tight_layout()
-            plt.savefig('predictions_comparison.png', dpi=150, bbox_inches='tight')
-            plt.show()
-            break
-
 
 
 class RSU7(nn.Module):
@@ -1406,67 +1349,72 @@ def get_simple_training_config():
         patience=5,
     )
 
+
+
     return model, combined_loss, optimizer, scheduler
 
 
-def load_model_with_multigpu_support(model, model_path):
-    """
-    加载模型，自动处理多GPU训练的权重
+def get_simple_optimized_config(len_train_loader):
+    """简化的优化配置"""
+    model = U2NET(n_channels=4, n_classes=1).to('cuda')
+    # 1. 优化损失函数
+    def improved_loss(pred, target):
+        # Focal Loss + Dice Loss + Tversky Loss（边界敏感）
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = 0.25 * (1 - pt) ** 2 * bce_loss
+        focal_loss = focal_loss.mean()
 
-    参数:
-        model: 模型实例
-        model_path: 权重文件路径
+        # Dice Loss
+        probs = torch.sigmoid(pred)
+        smooth = 1e-6
+        intersection = (probs * target).sum(dim=(1, 2, 3))
+        union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        dice_loss = 1 - dice.mean()
 
-    返回:
-        model: 加载权重后的模型
-    """
-    # 加载权重
-    checkpoint = torch.load(model_path, map_location='cpu')
+        # Tversky Loss（对FP和FN加权）
+        alpha, beta = 0.7, 0.3  # 惩罚FP更重
+        tp = intersection
+        fp = probs.sum(dim=(1, 2, 3)) - intersection
+        fn = target.sum(dim=(1, 2, 3)) - intersection
+        tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        tversky_loss = 1 - tversky.mean()
 
-    # 提取state_dict
-    if isinstance(checkpoint, dict):
-        # 检查是完整checkpoint还是直接state_dict
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-    else:
-        state_dict = checkpoint
+        return 0.4 * focal_loss + 0.4 * dice_loss + 0.2 * tversky_loss
 
-    # 检查是否是多GPU权重
-    if any(key.startswith('module.') for key in state_dict.keys()):
-        print("🔄 处理多GPU训练权重...")
-        # 移除'module.'前缀
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('module.'):
-                new_key = key[7:]  # 去掉'module.'
-            else:
-                new_key = key
-            new_state_dict[new_key] = value
-        state_dict = new_state_dict
+    # 2. 优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        betas=(0.9, 0.999),  # 调整beta
+        weight_decay=1e-4
+    )
 
-    # 加载权重
-    model.load_state_dict(state_dict)
-    model.eval()
+    # 3. 调度器
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=2e-4,  # 峰值学习率
+        epochs=100,
+        steps_per_epoch=len_train_loader,
+        pct_start=0.3,  # 30%的epoch用于升温
+        div_factor=25,  # 初始学习率 = max_lr/25
+        final_div_factor=1e4  # 最终学习率 = max_lr/1e4
+    )
 
-    print(f" 模型权重已加载（{len(state_dict)}个参数）")
-    return model
+    # 4. 梯度配置
+    gradient_config = {
+        'clip_norm': 1.0,
+        'accumulation_steps': 2
+    }
 
+    return model, improved_loss, optimizer, scheduler, gradient_config
 
 def main():
     """主训练函数"""
 
     # 获取配置
-    model, criterion, optimizer, scheduler = get_simple_training_config()
-
-    print(f"模型架构: {model.__class__.__name__}")
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    device_ids = list(range(torch.cuda.device_count()))
-    print(f"可用的GPU: {device_ids}")
+    # model, criterion, optimizer, scheduler = get_simple_training_config()
 
     # 设置
     set_seed(42)
@@ -1495,6 +1443,15 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+    model, criterion, optimizer, scheduler, gradient_config = get_simple_optimized_config(len(train_loader))
+
+    print(f"模型架构: {model.__class__.__name__}")
+    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+
+    device_ids = list(range(torch.cuda.device_count()))
+    print(f"可用的GPU: {device_ids}")
+
 
     # 训练模型
     train_model, history = train_model_multigpu_optimized(
@@ -1526,7 +1483,7 @@ def main():
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
         device='cuda',
-        save_dir='predictions_results',
+        save_dir='/kaggle/working/',
         multigpu=True
     )
 
