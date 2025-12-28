@@ -757,668 +757,412 @@ def predict_and_evaluate(model, test_loader, device='cuda', save_dir='prediction
     return results
 
 
-class RSU7(nn.Module):
-    """RSU-7模块: 高度为7的残差U块"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
-        super(RSU7, self).__init__()
-        self.out_ch = out_ch
 
-        # 编码器部分
-        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-
-        self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_ch)
-
-        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv2 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_ch)
-
-        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv3 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_ch)
-
-        self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv4 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(mid_ch)
-
-        self.pool4 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv5 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn5 = nn.BatchNorm2d(mid_ch)
-
-        self.pool5 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv6 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn6 = nn.BatchNorm2d(mid_ch)
-
-        # 最底层的卷积
-        self.conv7 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=2, padding=2, bias=False)
-        self.bn7 = nn.BatchNorm2d(mid_ch)
-
-        # 解码器部分
-        self.conv6d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn6d = nn.BatchNorm2d(mid_ch)
-
-        self.conv5d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn5d = nn.BatchNorm2d(mid_ch)
-
-        self.conv4d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4d = nn.BatchNorm2d(mid_ch)
-
-        self.conv3d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3d = nn.BatchNorm2d(mid_ch)
-
-        self.conv2d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2d = nn.BatchNorm2d(mid_ch)
-
-        self.conv1d = nn.Conv2d(mid_ch * 2, out_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1d = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
+# ==========================================
+# 核心模块 1: Coordinate Attention (保持0.7593版的成功设计)
+# ==========================================
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        # 保存原始输入用于残差连接
-        x_input = x
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = identity * a_w * a_h
+        return out
 
-        # 第一层卷积
-        hx = self.conv0(x_input)
-        hx_in = hx  # 保存用于残差连接
 
-        # 编码器路径
-        hx1 = self.relu(self.bn1(self.conv1(hx)))
+# ==========================================
+# 核心模块 2: SE-Fusion (新加入：优化侧边输出的融合)
+# 作用：在生成 d0 时，自动给 d1-d6 分配权重
+# ==========================================
+class SEFusion(nn.Module):
+    def __init__(self, in_channel=6, out_channel=1):
+        super(SEFusion, self).__init__()
+        self.conv = nn.Conv2d(in_channel, out_channel, 1)
+
+        # 通道注意力，用于给6个侧边输出打分
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channel, in_channel // 2 + 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channel // 2 + 1, in_channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x shape: [Batch, 6, H, W] (6个侧边输出的拼接)
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        # 加权融合
+        return self.conv(x * y.expand_as(x))
+
+
+# ==========================================
+# 基础组件
+# ==========================================
+class REBNCONV(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, dirate=1):
+        super(REBNCONV, self).__init__()
+        self.conv_s1 = nn.Conv2d(in_ch, out_ch, 3, padding=1 * dirate, dilation=1 * dirate)
+        self.bn_s1 = nn.BatchNorm2d(out_ch)
+        self.relu_s1 = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu_s1(self.bn_s1(self.conv_s1(x)))
+
+
+def _upsample_like(src, tar):
+    return F.interpolate(src, size=tar.shape[2:], mode='bilinear', align_corners=True)
+
+
+# ==========================================
+# RSU 模块 (基于0.7593版，微调Bottleneck)
+# ==========================================
+
+class RSU7(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super(RSU7, self).__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool4 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv5 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool5 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv6 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.rebnconv7 = REBNCONV(mid_ch, mid_ch, dirate=2)  # 保持Dilation
+        self.rebnconv6d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv5d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv4d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)  # 保持CoordAtt
+
+    def forward(self, x):
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin);
         hx = self.pool1(hx1)
-
-        hx2 = self.relu(self.bn2(self.conv2(hx)))
+        hx2 = self.rebnconv2(hx);
         hx = self.pool2(hx2)
-
-        hx3 = self.relu(self.bn3(self.conv3(hx)))
+        hx3 = self.rebnconv3(hx);
         hx = self.pool3(hx3)
-
-        hx4 = self.relu(self.bn4(self.conv4(hx)))
+        hx4 = self.rebnconv4(hx);
         hx = self.pool4(hx4)
-
-        hx5 = self.relu(self.bn5(self.conv5(hx)))
+        hx5 = self.rebnconv5(hx);
         hx = self.pool5(hx5)
-
-        hx6 = self.relu(self.bn6(self.conv6(hx)))
-
-        hx7 = self.relu(self.bn7(self.conv7(hx6)))
-
-        # 解码器路径
-        hx6d = self.relu(self.bn6d(self.conv6d(torch.cat((hx6, hx7), 1))))
-        hx6dup = F.interpolate(hx6d, size=hx5.shape[2:], mode='bilinear', align_corners=True)
-
-        hx5d = self.relu(self.bn5d(self.conv5d(torch.cat((hx5, hx6dup), 1))))
-        hx5dup = F.interpolate(hx5d, size=hx4.shape[2:], mode='bilinear', align_corners=True)
-
-        hx4d = self.relu(self.bn4d(self.conv4d(torch.cat((hx4, hx5dup), 1))))
-        hx4dup = F.interpolate(hx4d, size=hx3.shape[2:], mode='bilinear', align_corners=True)
-
-        hx3d = self.relu(self.bn3d(self.conv3d(torch.cat((hx3, hx4dup), 1))))
-        hx3dup = F.interpolate(hx3d, size=hx2.shape[2:], mode='bilinear', align_corners=True)
-
-        hx2d = self.relu(self.bn2d(self.conv2d(torch.cat((hx2, hx3dup), 1))))
-        hx2dup = F.interpolate(hx2d, size=hx1.shape[2:], mode='bilinear', align_corners=True)
-
-        hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
-
-        # 确保hx1d和hx_in大小一致，如果不一致则调整hx_in
-        if hx1d.shape != hx_in.shape:
-            # 调整hx_in的大小以匹配hx1d
-            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
-        else:
-            hx_in_adjusted = hx_in
-
-        # 残差连接
-        return hx1d + hx_in_adjusted
+        hx6 = self.rebnconv6(hx)
+        hx7 = self.rebnconv7(hx6)
+        hx6d = self.rebnconv6d(torch.cat((hx7, hx6), 1));
+        hx6dup = _upsample_like(hx6d, hx5)
+        hx5d = self.rebnconv5d(torch.cat((hx6dup, hx5), 1));
+        hx5dup = _upsample_like(hx5d, hx4)
+        hx4d = self.rebnconv4d(torch.cat((hx5dup, hx4), 1));
+        hx4dup = _upsample_like(hx4d, hx3)
+        hx3d = self.rebnconv3d(torch.cat((hx4dup, hx3), 1));
+        hx3dup = _upsample_like(hx3d, hx2)
+        hx2d = self.rebnconv2d(torch.cat((hx3dup, hx2), 1));
+        hx2dup = _upsample_like(hx2d, hx1)
+        hx1d = self.rebnconv1d(torch.cat((hx2dup, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
 
 
 class RSU6(nn.Module):
-    """RSU-6模块: 高度为6的残差U块"""
-
     def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU6, self).__init__()
-        self.out_ch = out_ch
-
-        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-
-        self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1);
         self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv2 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv3 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv4 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool4 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv5 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn5 = nn.BatchNorm2d(mid_ch)
-
-        self.conv6 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=2, padding=2, bias=False)
-        self.bn6 = nn.BatchNorm2d(mid_ch)
-
-        # 解码器
-        self.conv5d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn5d = nn.BatchNorm2d(mid_ch)
-
-        self.conv4d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4d = nn.BatchNorm2d(mid_ch)
-
-        self.conv3d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3d = nn.BatchNorm2d(mid_ch)
-
-        self.conv2d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2d = nn.BatchNorm2d(mid_ch)
-
-        self.conv1d = nn.Conv2d(mid_ch * 2, out_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1d = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
+        self.rebnconv5 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.rebnconv6 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv5d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv4d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)
 
     def forward(self, x):
-        # 保存原始输入用于残差连接
-        x_input = x
-
-        # 第一层卷积
-        hx = self.conv0(x_input)
-        hx_in = hx  # 保存用于残差连接
-
-        hx1 = self.relu(self.bn1(self.conv1(hx)))
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin);
         hx = self.pool1(hx1)
-
-        hx2 = self.relu(self.bn2(self.conv2(hx)))
+        hx2 = self.rebnconv2(hx);
         hx = self.pool2(hx2)
-
-        hx3 = self.relu(self.bn3(self.conv3(hx)))
+        hx3 = self.rebnconv3(hx);
         hx = self.pool3(hx3)
-
-        hx4 = self.relu(self.bn4(self.conv4(hx)))
+        hx4 = self.rebnconv4(hx);
         hx = self.pool4(hx4)
-
-        hx5 = self.relu(self.bn5(self.conv5(hx)))
-
-        hx6 = self.relu(self.bn6(self.conv6(hx5)))
-
-        hx5d = self.relu(self.bn5d(self.conv5d(torch.cat((hx5, hx6), 1))))
-        hx5dup = F.interpolate(hx5d, size=hx4.shape[2:], mode='bilinear', align_corners=True)
-
-        hx4d = self.relu(self.bn4d(self.conv4d(torch.cat((hx4, hx5dup), 1))))
-        hx4dup = F.interpolate(hx4d, size=hx3.shape[2:], mode='bilinear', align_corners=True)
-
-        hx3d = self.relu(self.bn3d(self.conv3d(torch.cat((hx3, hx4dup), 1))))
-        hx3dup = F.interpolate(hx3d, size=hx2.shape[2:], mode='bilinear', align_corners=True)
-
-        hx2d = self.relu(self.bn2d(self.conv2d(torch.cat((hx2, hx3dup), 1))))
-        hx2dup = F.interpolate(hx2d, size=hx1.shape[2:], mode='bilinear', align_corners=True)
-
-        hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
-
-        # 确保hx1d和hx_in大小一致
-        if hx1d.shape != hx_in.shape:
-            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
-        else:
-            hx_in_adjusted = hx_in
-
-        # 残差连接
-        return hx1d + hx_in_adjusted
+        hx5 = self.rebnconv5(hx)
+        hx6 = self.rebnconv6(hx5)
+        hx5d = self.rebnconv5d(torch.cat((hx6, hx5), 1));
+        hx5dup = _upsample_like(hx5d, hx4)
+        hx4d = self.rebnconv4d(torch.cat((hx5dup, hx4), 1));
+        hx4dup = _upsample_like(hx4d, hx3)
+        hx3d = self.rebnconv3d(torch.cat((hx4dup, hx3), 1));
+        hx3dup = _upsample_like(hx3d, hx2)
+        hx2d = self.rebnconv2d(torch.cat((hx3dup, hx2), 1));
+        hx2dup = _upsample_like(hx2d, hx1)
+        hx1d = self.rebnconv1d(torch.cat((hx2dup, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
 
 
 class RSU5(nn.Module):
-    """RSU-5模块: 高度为5的残差U块"""
-
     def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU5, self).__init__()
-        self.out_ch = out_ch
-
-        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-
-        self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1);
         self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv2 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv3 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv4 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(mid_ch)
-
-        self.conv5 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=2, padding=2, bias=False)
-        self.bn5 = nn.BatchNorm2d(mid_ch)
-
-        # 解码器
-        self.conv4d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn4d = nn.BatchNorm2d(mid_ch)
-
-        self.conv3d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3d = nn.BatchNorm2d(mid_ch)
-
-        self.conv2d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2d = nn.BatchNorm2d(mid_ch)
-
-        self.conv1d = nn.Conv2d(mid_ch * 2, out_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1d = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.rebnconv5 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv4d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)
 
     def forward(self, x):
-        # 保存原始输入用于残差连接
-        x_input = x
-
-        # 第一层卷积
-        hx = self.conv0(x_input)
-        hx_in = hx  # 保存用于残差连接
-
-        hx1 = self.relu(self.bn1(self.conv1(hx)))
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin);
         hx = self.pool1(hx1)
-
-        hx2 = self.relu(self.bn2(self.conv2(hx)))
+        hx2 = self.rebnconv2(hx);
         hx = self.pool2(hx2)
-
-        hx3 = self.relu(self.bn3(self.conv3(hx)))
+        hx3 = self.rebnconv3(hx);
         hx = self.pool3(hx3)
-
-        hx4 = self.relu(self.bn4(self.conv4(hx)))
-
-        hx5 = self.relu(self.bn5(self.conv5(hx4)))
-
-        hx4d = self.relu(self.bn4d(self.conv4d(torch.cat((hx4, hx5), 1))))
-        hx4dup = F.interpolate(hx4d, size=hx3.shape[2:], mode='bilinear', align_corners=True)
-
-        hx3d = self.relu(self.bn3d(self.conv3d(torch.cat((hx3, hx4dup), 1))))
-        hx3dup = F.interpolate(hx3d, size=hx2.shape[2:], mode='bilinear', align_corners=True)
-
-        hx2d = self.relu(self.bn2d(self.conv2d(torch.cat((hx2, hx3dup), 1))))
-        hx2dup = F.interpolate(hx2d, size=hx1.shape[2:], mode='bilinear', align_corners=True)
-
-        hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
-
-        # 确保hx1d和hx_in大小一致
-        if hx1d.shape != hx_in.shape:
-            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
-        else:
-            hx_in_adjusted = hx_in
-
-        # 残差连接
-        return hx1d + hx_in_adjusted
+        hx4 = self.rebnconv4(hx)
+        hx5 = self.rebnconv5(hx4)
+        hx4d = self.rebnconv4d(torch.cat((hx5, hx4), 1));
+        hx4dup = _upsample_like(hx4d, hx3)
+        hx3d = self.rebnconv3d(torch.cat((hx4dup, hx3), 1));
+        hx3dup = _upsample_like(hx3d, hx2)
+        hx2d = self.rebnconv2d(torch.cat((hx3dup, hx2), 1));
+        hx2dup = _upsample_like(hx2d, hx1)
+        hx1d = self.rebnconv1d(torch.cat((hx2dup, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
 
 
 class RSU4(nn.Module):
-    """RSU-4模块: 高度为4的残差U块"""
-
     def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU4, self).__init__()
-        self.out_ch = out_ch
-
-        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-
-        self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1);
         self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv2 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_ch)
-
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1);
         self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
-        self.conv3 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_ch)
-
-        self.conv4 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=2, padding=2, bias=False)
-        self.bn4 = nn.BatchNorm2d(mid_ch)
-
-        # 解码器
-        self.conv3d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3d = nn.BatchNorm2d(mid_ch)
-
-        self.conv2d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2d = nn.BatchNorm2d(mid_ch)
-
-        self.conv1d = nn.Conv2d(mid_ch * 2, out_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1d = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)
 
     def forward(self, x):
-        # 保存原始输入用于残差连接
-        x_input = x
-
-        # 第一层卷积
-        hx = self.conv0(x_input)
-        hx_in = hx  # 保存用于残差连接
-
-        hx1 = self.relu(self.bn1(self.conv1(hx)))
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin);
         hx = self.pool1(hx1)
-
-        hx2 = self.relu(self.bn2(self.conv2(hx)))
+        hx2 = self.rebnconv2(hx);
         hx = self.pool2(hx2)
-
-        hx3 = self.relu(self.bn3(self.conv3(hx)))
-
-        hx4 = self.relu(self.bn4(self.conv4(hx3)))
-
-        hx3d = self.relu(self.bn3d(self.conv3d(torch.cat((hx3, hx4), 1))))
-        hx3dup = F.interpolate(hx3d, size=hx2.shape[2:], mode='bilinear', align_corners=True)
-
-        hx2d = self.relu(self.bn2d(self.conv2d(torch.cat((hx2, hx3dup), 1))))
-        hx2dup = F.interpolate(hx2d, size=hx1.shape[2:], mode='bilinear', align_corners=True)
-
-        hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2dup), 1))))
-
-        # 确保hx1d和hx_in大小一致
-        if hx1d.shape != hx_in.shape:
-            hx_in_adjusted = F.interpolate(hx_in, size=hx1d.shape[2:], mode='bilinear', align_corners=True)
-        else:
-            hx_in_adjusted = hx_in
-
-        # 残差连接
-        return hx1d + hx_in_adjusted
+        hx3 = self.rebnconv3(hx)
+        hx4 = self.rebnconv4(hx3)
+        hx3d = self.rebnconv3d(torch.cat((hx4, hx3), 1));
+        hx3dup = _upsample_like(hx3d, hx2)
+        hx2d = self.rebnconv2d(torch.cat((hx3dup, hx2), 1));
+        hx2dup = _upsample_like(hx2d, hx1)
+        hx1d = self.rebnconv1d(torch.cat((hx2dup, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
 
 
+# ==========================================
+# RSU4F_Drop (新修改：在Bottleneck加入Dropout)
+# ==========================================
+class RSU4F_Drop(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, drop_prob=0.3):
+        super(RSU4F_Drop, self).__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=4)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=8)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=4)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=2)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)
+        # [新增] 正则化，防止深层过拟合
+        self.dropout = nn.Dropout2d(p=drop_prob)
+
+    def forward(self, x):
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin)
+        hx2 = self.rebnconv2(hx1)
+        hx3 = self.rebnconv3(hx2)
+        hx4 = self.rebnconv4(hx3)
+
+        # 在最深层特征处使用Dropout
+        hx4 = self.dropout(hx4)
+
+        hx3d = self.rebnconv3d(torch.cat((hx4, hx3), 1))
+        hx2d = self.rebnconv2d(torch.cat((hx3d, hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((hx2d, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
+
+
+# RSU4F 标准版 (用于非瓶颈层)
 class RSU4F(nn.Module):
-    """RSU-4F模块: 无下采样的RSU-4（使用空洞卷积）"""
-
     def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
         super(RSU4F, self).__init__()
-        self.out_ch = out_ch
-
-        self.conv0 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
-
-        self.conv1 = nn.Conv2d(out_ch, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_ch)
-
-        self.conv2 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=2, padding=2, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_ch)
-
-        self.conv3 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=4, padding=4, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_ch)
-
-        self.conv4 = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, dilation=8, padding=8, bias=False)
-        self.bn4 = nn.BatchNorm2d(mid_ch)
-
-        # 解码器
-        self.conv3d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn3d = nn.BatchNorm2d(mid_ch)
-
-        self.conv2d = nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=3, padding=1, bias=False)
-        self.bn2d = nn.BatchNorm2d(mid_ch)
-
-        self.conv1d = nn.Conv2d(mid_ch * 2, out_ch, kernel_size=3, padding=1, bias=False)
-        self.bn1d = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=4)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=8)
+        self.rebnconv3d = REBNCONV(mid_ch * 2, mid_ch, dirate=4)
+        self.rebnconv2d = REBNCONV(mid_ch * 2, mid_ch, dirate=2)
+        self.rebnconv1d = REBNCONV(mid_ch * 2, out_ch, dirate=1)
+        self.ca = CoordAtt(out_ch, out_ch)
 
     def forward(self, x):
-        # 保存原始输入用于残差连接
-        x_input = x
-
-        # 第一层卷积
-        hx = self.conv0(x_input)
-        hx_in = hx  # 保存用于残差连接
-
-        hx1 = self.relu(self.bn1(self.conv1(hx)))
-        hx2 = self.relu(self.bn2(self.conv2(hx1)))
-        hx3 = self.relu(self.bn3(self.conv3(hx2)))
-        hx4 = self.relu(self.bn4(self.conv4(hx3)))
-
-        hx3d = self.relu(self.bn3d(self.conv3d(torch.cat((hx3, hx4), 1))))
-        hx2d = self.relu(self.bn2d(self.conv2d(torch.cat((hx2, hx3d), 1))))
-        hx1d = self.relu(self.bn1d(self.conv1d(torch.cat((hx1, hx2d), 1))))
-
-        # RSU4F没有下采样，所以尺寸应该保持不变
-        # 残差连接
-        return hx1d + hx_in
+        hxin = self.rebnconvin(x)
+        hx1 = self.rebnconv1(hxin)
+        hx2 = self.rebnconv2(hx1)
+        hx3 = self.rebnconv3(hx2)
+        hx4 = self.rebnconv4(hx3)
+        hx3d = self.rebnconv3d(torch.cat((hx4, hx3), 1))
+        hx2d = self.rebnconv2d(torch.cat((hx3d, hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((hx2d, hx1), 1))
+        hx1d = self.ca(hx1d)
+        return hx1d + hxin
 
 
-# 1. 统一的轻量多尺度模块（三种规格）
-class MultiScaleBlock(nn.Module):
-    """统一的多尺度模块，可根据层级调整复杂度"""
+# ==========================================
+# 终极稳定优化版: U2Net + RSU_CA + Drop + SE_Fusion
+# ==========================================
+class U2Net_RS_Final(nn.Module):
+    def __init__(self, in_ch=4, out_ch=1):
+        super(U2Net_RS_Final, self).__init__()
 
-    def __init__(self, channels, level='deep'):
-        super().__init__()
-
-        # 根据网络深度调整模块复杂度
-        if level == 'shallow':  # 浅层：轻量，保持细节
-            branch_channels = max(channels // 8, 8)
-            dilation_rates = [1, 2]
-        elif level == 'middle':  # 中层：中等复杂度
-            branch_channels = max(channels // 6, 16)
-            dilation_rates = [1, 2, 4]
-        else:  # 深层：最强多尺度能力
-            branch_channels = max(channels // 4, 32)
-            dilation_rates = [1, 3, 6, 9]
-
-        # 创建多个不同感受野的分支
-        self.branches = nn.ModuleList()
-        for rate in dilation_rates:
-            self.branches.append(
-                nn.Sequential(
-                    nn.Conv2d(channels, branch_channels, 3,
-                              padding=rate, dilation=rate, bias=False),
-                    nn.BatchNorm2d(branch_channels),
-                    nn.ReLU(inplace=True)
-                )
-            )
-
-        # 全局上下文分支（对中层和深层特别重要）
-        if level in ['middle', 'deep']:
-            self.global_branch = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(channels, branch_channels, 1, bias=False),
-                nn.BatchNorm2d(branch_channels),
-                nn.ReLU(inplace=True)
-            )
-            num_branches = len(self.branches) + 1
-        else:
-            self.global_branch = None
-            num_branches = len(self.branches)
-
-        # 特征融合层
-        total_channels = branch_channels * num_branches
-        self.fusion = nn.Sequential(
-            nn.Conv2d(total_channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-
-        # 可学习的分支权重
-        self.branch_weights = nn.Parameter(torch.ones(num_branches) / num_branches)
-
-    def forward(self, x):
-        features = []
-
-        # 处理各个空洞卷积分支
-        for branch in self.branches:
-            features.append(branch(x))
-
-        # 全局上下文分支
-        if self.global_branch is not None:
-            global_feat = self.global_branch(x)
-            global_feat = F.interpolate(global_feat, size=x.shape[2:],
-                                        mode='bilinear', align_corners=True)
-            features.append(global_feat)
-
-        # 自适应加权融合
-        weighted_features = []
-        for i, feat in enumerate(features):
-            weight = self.branch_weights[i]
-            weighted_features.append(weight * feat)
-
-        # 拼接并融合
-        combined = torch.cat(weighted_features, dim=1)
-        return self.fusion(combined)
-
-
-# 2. 分层增强的RSU模块
-class RSU4_Enhanced(nn.Module):
-    """RSU4增强版：中层多尺度"""
-
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
-        super().__init__()
-        # 继承原始RSU4（你需要有RSU4的定义）
-        self.rsu = RSU4(in_ch, mid_ch, out_ch)
-
-        # 在中层（conv4位置）添加多尺度增强
-        self.rsu.conv4 = MultiScaleBlock(mid_ch, level='middle')
-
-    def forward(self, x):
-        return self.rsu(x)
-
-
-class RSU5_Enhanced(nn.Module):
-    """RSU5增强版：中深层多尺度"""
-
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
-        super().__init__()
-        self.rsu = RSU5(in_ch, mid_ch, out_ch)
-
-        # 在深层（conv5位置）添加更强的多尺度
-        self.rsu.conv5 = MultiScaleBlock(mid_ch, level='deep')
-
-    def forward(self, x):
-        return self.rsu(x)
-
-
-class RSU4F_Enhanced(nn.Module):
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3, level='middle'):
-        super().__init__()
-        # 继承或复制原始RSU4F结构
-        # ... 原始RSU4F的所有层 ...
-        self.rsu = RSU4F(in_ch, mid_ch, out_ch)
-        # RSU4F通常有多个空洞卷积层，可以增强conv3, conv4
-        self.rsu.conv3 = MultiScaleBlock(mid_ch, level=level)
-        self.rsu.conv4 = MultiScaleBlock(mid_ch, level=level)
-
-    def forward(self, x):
-        return self.rsu(x)
-
-class RSU6_Enhanced(nn.Module):
-    """RSU6增强版：深层最强多尺度"""
-
-    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
-        super().__init__()
-        self.rsu = RSU6(in_ch, mid_ch, out_ch)
-
-        # 在底层（conv6位置）添加最强多尺度
-        self.rsu.conv6 = MultiScaleBlock(mid_ch, level='deep')
-
-        # RSU6还可以在conv5位置也增强
-        self.rsu.conv5 = MultiScaleBlock(mid_ch, level='middle')
-
-    def forward(self, x):
-        return self.rsu(x)
-
-
-class FullyEnhancedU2Net(nn.Module):
-    """编码器-解码器完全对称增强的U²-Net"""
-
-    def __init__(self, n_channels=4, n_classes=1):
-        super().__init__()
-
-        # ========== 编码器增强 ==========
-        self.stage1 = RSU7(n_channels, 32, 64)  # 输入6通道(光学+DEM)
-        self.stage2 = RSU6(64, 32, 128)
-        self.stage3 = RSU5_Enhanced(128, 64, 256)  # 增强
-        self.stage4 = RSU4_Enhanced(256, 128, 512)  # 增强
-        self.stage5 = RSU5_Enhanced(512, 256, 512)  # 增强
-        self.stage6 = RSU6_Enhanced(512, 256, 512)  # 增强
-
-        # ========== 解码器对称增强 ==========
-        self.stage5d = RSU4F_Enhanced(1024, 256, 512)  # 增强
-        self.stage4d = RSU4_Enhanced(1024, 128, 256)  # 增强
-        self.stage3d = RSU5_Enhanced(512, 64, 128)  # 增强
-        self.stage2d = RSU6(256, 32, 64)  # 保持原始
-        self.stage1d = RSU7(128, 16, 64)  # 保持原始
-
-        # 下采样层
+        # Encoder
+        self.stage1 = RSU7(in_ch, 32, 64)
         self.pool12 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage2 = RSU6(64, 32, 128)
         self.pool23 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage3 = RSU5(128, 64, 256)
         self.pool34 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage4 = RSU4(256, 128, 512)
         self.pool45 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+
+        # Stage 5 和 6 (最深层) 使用带 Dropout 的版本，防止过拟合
+        self.stage5 = RSU4F_Drop(512, 256, 512, drop_prob=0.2)
         self.pool56 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage6 = RSU4F_Drop(512, 256, 512, drop_prob=0.3)
 
-        # 侧边输出（保持不变）
-        self.side1 = nn.Conv2d(64, n_classes, 3, padding=1)
-        self.side2 = nn.Conv2d(64, n_classes, 3, padding=1)
-        self.side3 = nn.Conv2d(128, n_classes, 3, padding=1)
-        self.side4 = nn.Conv2d(256, n_classes, 3, padding=1)
-        self.side5 = nn.Conv2d(512, n_classes, 3, padding=1)
-        self.side6 = nn.Conv2d(512, n_classes, 3, padding=1)
-        self.outconv = nn.Conv2d(6 * n_classes, n_classes, 1)
+        # Decoder (保持 RSU4F 标准版)
+        self.stage5d = RSU4F(1024, 256, 512)
+        self.stage4d = RSU4(1024, 128, 256)
+        self.stage3d = RSU5(512, 64, 128)
+        self.stage2d = RSU6(256, 32, 64)
+        self.stage1d = RSU7(128, 16, 64)
 
-    def forward(self, optical, dem):
-        # 早期融合
-        x = torch.cat([optical, dem], dim=1)
+        # Side Outputs
+        self.side1 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side2 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side3 = nn.Conv2d(128, out_ch, 3, padding=1)
+        self.side4 = nn.Conv2d(256, out_ch, 3, padding=1)
+        self.side5 = nn.Conv2d(512, out_ch, 3, padding=1)
+        self.side6 = nn.Conv2d(512, out_ch, 3, padding=1)
 
-        # 编码路径（增强版）
+        # [改进点] 使用 SEFusion 代替普通的 Conv 融合
+        # 输入是6个侧边输出的concat (6 * 1 = 6通道)
+        self.outconv = SEFusion(in_channel=6 * out_ch, out_channel=out_ch)
+
+    def forward(self, rgb, dem):
+        # 1. 拼接
+        x = torch.cat([rgb, dem], dim=1)
+
+        # 2. Encoder
         hx1 = self.stage1(x)
         hx = self.pool12(hx1)
-
         hx2 = self.stage2(hx)
         hx = self.pool23(hx2)
-
-        hx3 = self.stage3(hx)  # 增强
+        hx3 = self.stage3(hx)
         hx = self.pool34(hx3)
-
-        hx4 = self.stage4(hx)  # 增强
+        hx4 = self.stage4(hx)
         hx = self.pool45(hx4)
-
-        hx5 = self.stage5(hx)  # 增强
+        hx5 = self.stage5(hx)
         hx = self.pool56(hx5)
+        hx6 = self.stage6(hx)
 
-        hx6 = self.stage6(hx)  # 增强
-
-        # 解码路径（对称增强）
-        hx6up = F.interpolate(hx6, size=hx5.shape[2:], mode='bilinear', align_corners=True)
-        hx5d = self.stage5d(torch.cat((hx6up, hx5), 1))  # 增强
-
-        hx5dup = F.interpolate(hx5d, size=hx4.shape[2:], mode='bilinear', align_corners=True)
-        hx4d = self.stage4d(torch.cat((hx5dup, hx4), 1))  # 增强
-
-        hx4dup = F.interpolate(hx4d, size=hx3.shape[2:], mode='bilinear', align_corners=True)
-        hx3d = self.stage3d(torch.cat((hx4dup, hx3), 1))  # 增强
-
+        # 3. Decoder
+        hx6up = _upsample_like(hx6, hx5)
+        hx5d = self.stage5d(torch.cat((hx6up, hx5), 1))
+        hx5dup = _upsample_like(hx5d, hx4)
+        hx4d = self.stage4d(torch.cat((hx5dup, hx4), 1))
+        hx4dup = _upsample_like(hx4d, hx3)
         hx3d = self.stage3d(torch.cat((hx4dup, hx3), 1))
-        hx3dup = F.interpolate(hx3d, size=hx2.shape[2:], mode='bilinear', align_corners=True)
-
-
+        hx3dup = _upsample_like(hx3d, hx2)
         hx2d = self.stage2d(torch.cat((hx3dup, hx2), 1))
-        hx2dup = F.interpolate(hx2d, size=hx1.shape[2:], mode='bilinear', align_corners=True)
-
+        hx2dup = _upsample_like(hx2d, hx1)
         hx1d = self.stage1d(torch.cat((hx2dup, hx1), 1))
 
-        # 侧边输出
+        # 4. Side Outputs
         d1 = self.side1(hx1d)
-
         d2 = self.side2(hx2d)
-        d2 = F.interpolate(d2, size=x.shape[2:], mode='bilinear', align_corners=True)
-
         d3 = self.side3(hx3d)
-        d3 = F.interpolate(d3, size=x.shape[2:], mode='bilinear', align_corners=True)
-
         d4 = self.side4(hx4d)
-        d4 = F.interpolate(d4, size=x.shape[2:], mode='bilinear', align_corners=True)
-
         d5 = self.side5(hx5d)
-        d5 = F.interpolate(d5, size=x.shape[2:], mode='bilinear', align_corners=True)
-
         d6 = self.side6(hx6)
-        d6 = F.interpolate(d6, size=x.shape[2:], mode='bilinear', align_corners=True)
 
-        # 融合所有侧边输出
+        d2 = _upsample_like(d2, d1)
+        d3 = _upsample_like(d3, d1)
+        d4 = _upsample_like(d4, d1)
+        d5 = _upsample_like(d5, d1)
+        d6 = _upsample_like(d6, d1)
+
+        # 5. Fusion (使用SEFusion自动加权)
         d0 = self.outconv(torch.cat((d1, d2, d3, d4, d5, d6), 1))
 
         return d0
-
 
 class BoundarySensitiveDiceLoss(nn.Module):
     """
@@ -1778,11 +1522,11 @@ class LandslideOptimizedLoss(nn.Module):
             'current_weights': getattr(self, 'current_weights', None)
         }
 
-def get_simple_training_config():
+def get_simple_training_config_enhance():
     """获取简单训练配置"""
 
     # 1. 创建简单模型
-    model = FullyEnhancedU2Net(n_channels=4, n_classes=1).to('cuda')
+    model = U2Net_RS_Final(in_ch=4, out_ch=1).to('cuda')
 
     # 2. 使用滑坡专用损失函数（直接替换这里！）
     # ============ 替换开始 ============
@@ -1825,18 +1569,23 @@ def get_simple_training_config():
 
     return model, combined_loss, optimizer, scheduler
 
-def get_simple_optimized_config(len_train_loader):
-    """简化的优化配置"""
-    model = FullyEnhancedU2Net(n_channels=4, n_classes=1).to('cuda')
-    # 1. 优化损失函数
-    def improved_loss(pred, target):
-        # Focal Loss + Dice Loss + Tversky Loss（边界敏感）
-        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = 0.25 * (1 - pt) ** 2 * bce_loss
-        focal_loss = focal_loss.mean()
+def get_simple_training_config():
+    """获取简单训练配置"""
 
-        # Dice Loss
+    # 1. 创建简单模型
+    model = U2Net_RS_Final(in_ch=4, out_ch=1).to('cuda')
+
+    # 2. 使用标准损失函数（先排除复杂的损失函数）
+    def simple_loss(pred, target):
+        """简单的BCE损失函数"""
+        return nn.BCEWithLogitsLoss()(pred, target)
+
+    # 或者联合损失
+    def combined_loss(pred, target):
+        """BCE + Dice损失"""
+        bce = nn.BCEWithLogitsLoss()(pred, target)
+
+        # Dice损失
         probs = torch.sigmoid(pred)
         smooth = 1e-6
         intersection = (probs * target).sum(dim=(1, 2, 3))
@@ -1844,42 +1593,49 @@ def get_simple_optimized_config(len_train_loader):
         dice = (2. * intersection + smooth) / (union + smooth)
         dice_loss = 1 - dice.mean()
 
-        # Tversky Loss（对FP和FN加权）
-        alpha, beta = 0.7, 0.3  # 惩罚FP更重
-        tp = intersection
-        fp = probs.sum(dim=(1, 2, 3)) - intersection
-        fn = target.sum(dim=(1, 2, 3)) - intersection
-        tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
-        tversky_loss = 1 - tversky.mean()
+        return bce + dice_loss
 
-        return 0.4 * focal_loss + 0.4 * dice_loss + 0.2 * tversky_loss
+    def combined_loss_v1(pred, target, alpha=0.25, gamma=2.0, dice_weight=0.5):
+        """
+        Focal Loss + Dice Loss
+        优点：自动处理类别不平衡，对简单样本降权
+        适合：FP过多，正负样本极不平衡的情况
+        """
+        # Focal Loss部分
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+        focal_loss = focal_loss.mean()
 
-    # 2. 优化器
+        # Dice Loss部分
+        probs = torch.sigmoid(pred)
+        smooth = 1e-6
+        intersection = (probs * target).sum(dim=(1, 2, 3))
+        union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        dice_loss = 1 - dice.mean()
+
+        return focal_loss + dice_weight * dice_loss
+
+    # 3. 优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=1e-4,
-        betas=(0.9, 0.999),  # 调整beta
         weight_decay=1e-4
     )
 
-    # 3. 调度器
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # 4. 学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        max_lr=2e-4,  # 峰值学习率
-        epochs=100,
-        steps_per_epoch=len_train_loader,
-        pct_start=0.3,  # 30%的epoch用于升温
-        div_factor=25,  # 初始学习率 = max_lr/25
-        final_div_factor=1e4  # 最终学习率 = max_lr/1e4
+        mode='min',
+        factor=0.5,
+        patience=5,
     )
 
-    # 4. 梯度配置
-    gradient_config = {
-        'clip_norm': 1.0,
-        'accumulation_steps': 2
-    }
 
-    return model, improved_loss, optimizer, scheduler, gradient_config
+
+    return model, combined_loss, optimizer, scheduler
+
 
 def main():
     """主训练函数"""
@@ -1914,8 +1670,6 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # model, criterion, optimizer, scheduler, gradient_config = get_simple_optimized_config(len(train_loader))
 
     print(f"模型架构: {model.__class__.__name__}")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")

@@ -1354,67 +1354,11 @@ def get_simple_training_config():
     return model, combined_loss, optimizer, scheduler
 
 
-def get_simple_optimized_config(len_train_loader):
-    """简化的优化配置"""
-    model = U2NET(n_channels=4, n_classes=1).to('cuda')
-    # 1. 优化损失函数
-    def improved_loss(pred, target):
-        # Focal Loss + Dice Loss + Tversky Loss（边界敏感）
-        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = 0.25 * (1 - pt) ** 2 * bce_loss
-        focal_loss = focal_loss.mean()
-
-        # Dice Loss
-        probs = torch.sigmoid(pred)
-        smooth = 1e-6
-        intersection = (probs * target).sum(dim=(1, 2, 3))
-        union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-        dice = (2. * intersection + smooth) / (union + smooth)
-        dice_loss = 1 - dice.mean()
-
-        # Tversky Loss（对FP和FN加权）
-        alpha, beta = 0.7, 0.3  # 惩罚FP更重
-        tp = intersection
-        fp = probs.sum(dim=(1, 2, 3)) - intersection
-        fn = target.sum(dim=(1, 2, 3)) - intersection
-        tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
-        tversky_loss = 1 - tversky.mean()
-
-        return 0.4 * focal_loss + 0.4 * dice_loss + 0.2 * tversky_loss
-
-    # 2. 优化器
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        betas=(0.9, 0.999),  # 调整beta
-        weight_decay=1e-4
-    )
-
-    # 3. 调度器
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=2e-4,  # 峰值学习率
-        epochs=100,
-        steps_per_epoch=len_train_loader,
-        pct_start=0.3,  # 30%的epoch用于升温
-        div_factor=25,  # 初始学习率 = max_lr/25
-        final_div_factor=1e4  # 最终学习率 = max_lr/1e4
-    )
-
-    # 4. 梯度配置
-    gradient_config = {
-        'clip_norm': 1.0,
-        'accumulation_steps': 2
-    }
-
-    return model, improved_loss, optimizer, scheduler, gradient_config
-
 def main():
     """主训练函数"""
 
     # 获取配置
-    # model, criterion, optimizer, scheduler = get_simple_training_config()
+    model, criterion, optimizer, scheduler = get_simple_training_config()
 
     # 设置
     set_seed(42)
@@ -1443,8 +1387,6 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    model, criterion, optimizer, scheduler, gradient_config = get_simple_optimized_config(len(train_loader))
 
     print(f"模型架构: {model.__class__.__name__}")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")

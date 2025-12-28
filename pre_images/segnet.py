@@ -132,7 +132,7 @@ def get_simple_training_config():
     """获取简单训练配置"""
 
     # 1. 创建简单模型
-    model = SegNet(n_channels=4, n_classes=1).to('cuda')
+    model = SegNet(n_channels=4, n_classes=1)
 
     # 2. 使用标准损失函数（先排除复杂的损失函数）
     def simple_loss(pred, target):
@@ -217,17 +217,15 @@ def main():
         batch_size=8,
         num_workers=2
     )
-
-
-    model.load_state_dict(torch.load('/kaggle/working/final_SegNet_model.pth'))
+    model.load_state_dict(torch.load(r'F:\zx\模型结果及参数\final_SegNet_model.pth', map_location=torch.device('cpu')))
     model.eval()
 
     # 2. 运行评估
     results = predict_and_evaluate(
         model=model,
         test_loader=test_loader,  # 你的测试数据加载器
-        device='cuda',
-        save_dir='predictions_results',
+        device='cpu',
+        save_dir='F:\zx\predictions_results\predictions_results_segnet',
         multigpu=True
     )
 
