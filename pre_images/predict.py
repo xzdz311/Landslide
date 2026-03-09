@@ -577,3 +577,213 @@ def visualize_predictions_comparison(model, test_loader, device='cpu', num_sampl
             plt.show()
             break
 
+
+def predict_and_evaluate_att(model, test_loader, device='cuda', save_dir='predictions', multigpu=False, use_tta=True,
+                         threshold=0.5):
+    """
+    U2Net_RS_Final 专用预测评估函数 (集成 TTA)
+
+    参数:
+        use_tta (bool): 是否开启测试时增强 (Test Time Augmentation)，推荐开启以冲击高分
+        threshold (float): 二值化阈值，建议尝试 0.4 或 0.5
+    """
+    import os
+    import cv2
+    import numpy as np
+    import torch
+    import torch.nn as nn  # 确保引入 nn
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    from sklearn.metrics import jaccard_score, precision_score, recall_score, f1_score
+    import pandas as pd  # 移到这里
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 多GPU处理
+    if multigpu and torch.cuda.device_count() > 1:
+        print(f"使用 {torch.cuda.device_count()} 个GPU进行评估")
+        # 只有当模型还不是DataParallel时才包装
+        if not isinstance(model, nn.DataParallel):
+            model = nn.DataParallel(model)
+
+    model = model.to(device)
+    model.eval()
+
+    metrics = {'iou': [], 'precision': [], 'recall': [], 'f1': [], 'accuracy': []}
+    sample_results = []
+
+    print(f"开始评估 (TTA={'开启' if use_tta else '关闭'}, Threshold={threshold})...")
+
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(test_loader, desc='Testing')):
+            # 1. 解包数据
+            if len(batch) == 4:
+                optical, dem, mask, img_paths = batch
+            elif len(batch) == 5:
+                optical, dem, mask, is_landslide, img_paths = batch
+            else:
+                continue  # 跳过异常batch
+
+            optical = optical.to(device)
+            dem = dem.to(device)
+            # mask 保持在 CPU 用于计算指标
+
+            # 2. 模型预测 (核心修改：集成 TTA)
+            if use_tta:
+                # A. 原图预测
+                out_raw = model(optical, dem)
+                if isinstance(out_raw, (tuple, list)): out_raw = out_raw[0]  # 兼容多输出
+                pred_raw = torch.sigmoid(out_raw)
+
+                # B. 水平翻转预测
+                opt_h = torch.flip(optical, [3])
+                dem_h = torch.flip(dem, [3])
+                out_h = model(opt_h, dem_h)
+                if isinstance(out_h, (tuple, list)): out_h = out_h[0]
+                pred_h = torch.sigmoid(out_h)
+                pred_h = torch.flip(pred_h, [3])  # 翻转回来
+
+                # C. 垂直翻转预测
+                opt_v = torch.flip(optical, [2])
+                dem_v = torch.flip(dem, [2])
+                out_v = model(opt_v, dem_v)
+                if isinstance(out_v, (tuple, list)): out_v = out_v[0]
+                pred_v = torch.sigmoid(out_v)
+                pred_v = torch.flip(pred_v, [2])  # 翻转回来
+
+                # D. 融合 (取平均)
+                pred_probs = (pred_raw + pred_h + pred_v) / 3.0
+            else:
+                # 不使用 TTA
+                outputs = model(optical, dem)
+                # 兼容性检查：如果返回的是 tuple (d0, d1...), 取 d0
+                if isinstance(outputs, (tuple, list)):
+                    outputs = outputs[0]
+                pred_probs = torch.sigmoid(outputs)
+
+            # 转回 CPU
+            pred_probs = pred_probs.cpu()
+
+            # 3. 阈值化
+            preds = (pred_probs > threshold).float()
+
+            # 4. 逐样本处理
+            for j in range(len(img_paths)):
+                img_path = img_paths[j]
+                img_name = os.path.basename(img_path)
+                base_name = os.path.splitext(img_name)[0]
+
+                # 获取当前样本的预测和真值
+                curr_pred_prob = pred_probs[j].squeeze().numpy()
+                curr_pred_mask = preds[j].squeeze().numpy()
+                curr_true_mask = mask[j].squeeze().numpy() if mask is not None else None
+
+                # 保存预测图 (可选，防止磁盘写满，可以注释掉)
+                # cv2.imwrite(os.path.join(save_dir, f'pred_{base_name}.png'), (curr_pred_mask * 255).astype(np.uint8))
+
+                # --- 指标计算 ---
+                if curr_true_mask is not None and curr_true_mask.max() > 0:  # 只有当存在真值时才计算
+                    # 展平
+                    y_true = (curr_true_mask > 0.5).astype(int).flatten()
+                    y_pred = curr_pred_mask.astype(int).flatten()
+
+                    # 计算各项指标
+                    iou = jaccard_score(y_true, y_pred, zero_division=0)
+                    precision = precision_score(y_true, y_pred, zero_division=0)
+                    recall = recall_score(y_true, y_pred, zero_division=0)
+                    f1 = f1_score(y_true, y_pred, zero_division=0)
+                    acc = np.mean(y_true == y_pred)
+
+                    # 记录
+                    metrics['iou'].append(iou)
+                    metrics['precision'].append(precision)
+                    metrics['recall'].append(recall)
+                    metrics['f1'].append(f1)
+                    metrics['accuracy'].append(acc)
+
+                    # 混淆矩阵计数
+                    tp = np.sum((y_true == 1) & (y_pred == 1))
+                    fp = np.sum((y_true == 0) & (y_pred == 1))
+                    fn = np.sum((y_true == 1) & (y_pred == 0))
+                    tn = np.sum((y_true == 0) & (y_pred == 0))
+
+                    sample_results.append({
+                        'image': img_name,
+                        'iou': iou,
+                        'precision': precision,
+                        'recall': recall,
+                        'f1': f1,
+                        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn
+                    })
+
+                    # 可视化 (仅对IoU较低或特定的样本，避免生成太多图)
+                    # 例如：只保存 IoU < 0.5 的坏样本，或者是那个特定的坏案例
+                    if iou < 0.5:
+                        try:
+                            if os.path.exists(img_path):
+                                orig_img = cv2.imread(img_path)
+                                if orig_img is not None:
+                                    orig_img = cv2.resize(orig_img, (curr_pred_mask.shape[1], curr_pred_mask.shape[0]))
+
+                                    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                                    axs[0].imshow(cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB))
+                                    axs[0].set_title(f'Image (IoU={iou:.3f})')
+                                    axs[1].imshow(curr_true_mask, cmap='gray')
+                                    axs[1].set_title('Ground Truth')
+                                    axs[2].imshow(curr_pred_prob, cmap='jet', vmin=0, vmax=1)
+                                    axs[2].set_title('Prediction (Prob)')
+                                    [ax.axis('off') for ax in axs]
+                                    plt.savefig(os.path.join(save_dir, f'bad_case_{base_name}.png'))
+                                    plt.close()
+                        except:
+                            pass
+
+    # 5. 汇总统计
+    if metrics['iou']:
+        print("\n" + "=" * 60)
+        print(f"评估完成 (TTA={use_tta})")
+        print("=" * 60)
+
+        # 保存详细结果
+        df = pd.DataFrame(sample_results)
+        df.to_csv(os.path.join(save_dir, 'detailed_metrics.csv'), index=False)
+
+        # 计算宏观指标 (Macro Average - 基于混淆矩阵总和)
+        total_tp = df['tp'].sum()
+        total_fp = df['fp'].sum()
+        total_fn = df['fn'].sum()
+
+        macro_iou = total_tp / (total_tp + total_fp + total_fn + 1e-10)
+        macro_f1 = 2 * total_tp / (2 * total_tp + total_fp + total_fn + 1e-10)
+        macro_recall = total_tp / (total_tp + total_fn + 1e-10)
+        macro_prec = total_tp / (total_tp + total_fp + 1e-10)
+
+        # 计算微观指标 (Micro Average - 基于每张图指标的平均)
+        micro_iou = np.mean(metrics['iou'])
+        micro_f1 = np.mean(metrics['f1'])
+
+        print(f"{'Metric':<15} {'Micro (Mean)':<15} {'Macro (Global)':<15}")
+        print("-" * 45)
+        print(f"{'IoU':<15} {micro_iou:.4f}           {macro_iou:.4f}")
+        print(f"{'F1 Score':<15} {micro_f1:.4f}           {macro_f1:.4f}")
+        print(f"{'Precision':<15} {np.mean(metrics['precision']):.4f}           {macro_prec:.4f}")
+        print(f"{'Recall':<15} {np.mean(metrics['recall']):.4f}           {macro_recall:.4f}")
+
+        # 统计分析
+        stats = {
+            'metric': ['iou', 'f1', 'precision', 'recall'],
+            'mean': [micro_iou, micro_f1, np.mean(metrics['precision']), np.mean(metrics['recall'])],
+            'std': [np.std(metrics['iou']), np.std(metrics['f1']), np.std(metrics['precision']),
+                    np.std(metrics['recall'])],
+            'min': [np.min(metrics['iou']), np.min(metrics['f1']), np.min(metrics['precision']),
+                    np.min(metrics['recall'])]
+        }
+        pd.DataFrame(stats).to_csv(os.path.join(save_dir, 'summary_stats.csv'), index=False)
+
+        return {
+            'iou': micro_iou,
+            'f1': micro_f1,
+            'macro_iou': macro_iou
+        }
+    else:
+        return {}
